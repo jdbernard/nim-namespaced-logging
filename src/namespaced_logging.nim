@@ -1,25 +1,36 @@
-import logging, sequtils
+import logging, sequtils, strutils
+
+export logging.Level
 
 type
   LoggingNamespace* = ref object
     name: string
     level*: Level
-    prependNamespace*: bool
+    msgPrefix*: string
 
-proc initLoggingNamespace*(
-    name: string,
-    level = lvlInfo,
-    prependNamespace = true
-  ): LoggingNamespace =
+var knownNamespaces {.threadvar.}: seq[LoggingNamespace]
 
-  return LoggingNamespace(
+proc initLoggingNamespace*(name: string, level = lvlInfo, msgPrefix: string): LoggingNamespace =
+  result = LoggingNamespace(
     name: name,
     level: level,
-    prependNamespace: prependNamespace)
+    msgPrefix: msgPrefix)
 
+  knownNamespaces.add(result)
+
+proc initLoggingNamespace*(name: string, level = lvlInfo): LoggingNamespace =
+  return initLoggingNamespace(name, level, name & ": ")
+
+proc setLevelForNamespace*(namespace: string, lvl: Level) =
+  let found = knownNamespaces.filterIt(it.name == namespace)
+  for ns in found: ns.level = lvl
+
+proc name*(ns: LoggingNamespace): string = ns.name
 proc log*(ns: LoggingNamespace, level: Level, args: varargs[string, `$`]) =
   if level >= ns.level:
-    if ns.prependNamespace: log(level, args.mapIt(ns.name & it))
+    if not ns.msgPrefix.isEmptyOrWhitespace:
+      log(level, args.mapIt(ns.msgPrefix & it))
+    else: log(level, args)
 
 proc debug*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlDebug, args)
 proc info*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlInfo, args)
