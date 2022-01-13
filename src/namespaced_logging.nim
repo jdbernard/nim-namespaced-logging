@@ -1,7 +1,29 @@
-# This is just an example to get you started. A typical library package
-# exports the main API in this file. Note that you cannot rename this file
-# but you can remove it if you wish.
+import logging, sequtils
 
-proc add*(x, y: int): int =
-  ## Adds two files together.
-  return x + y
+type
+  LoggingNamespace* = ref object
+    name: string
+    level*: Level
+    prependNamespace*: bool
+
+proc initLoggingNamespace*(
+    name: string,
+    level = lvlInfo,
+    prependNamespace = true
+  ): LoggingNamespace =
+
+  return LoggingNamespace(
+    name: name,
+    level: level,
+    prependNamespace: prependNamespace)
+
+proc log*(ns: LoggingNamespace, level: Level, args: varargs[string, `$`]) =
+  if level >= ns.level:
+    if ns.prependNamespace: log(level, args.mapIt(ns.name & it))
+
+proc debug*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlDebug, args)
+proc info*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlInfo, args)
+proc notice*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlNotice, args)
+proc warn*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlWarn, args)
+proc error*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlError, args)
+proc fatal*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlFatal, args)
