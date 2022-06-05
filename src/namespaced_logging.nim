@@ -1,4 +1,4 @@
-import logging, sequtils, strutils
+import logging, sequtils, strutils, tables
 
 export logging.Level
 
@@ -8,7 +8,12 @@ type
     level*: Level
     msgPrefix*: string
 
-var knownNamespaces {.threadvar.}: seq[LoggingNamespace]
+var knownNamespacesInst {.threadvar.}: TableRef[string, LoggingNamespace]
+
+template knownNamespaces(): TableRef[string, LoggingNamespace] =
+  if knownNamespacesInst == nil:
+    knownNamespacesInst = newTable[string, LoggingNamespace]()
+  knownNamespacesInst
 
 proc initLoggingNamespace*(name: string, level = lvlInfo, msgPrefix: string): LoggingNamespace =
   result = LoggingNamespace(
@@ -16,14 +21,21 @@ proc initLoggingNamespace*(name: string, level = lvlInfo, msgPrefix: string): Lo
     level: level,
     msgPrefix: msgPrefix)
 
-  knownNamespaces.add(result)
+  knownNamespaces[name] = result
 
 proc initLoggingNamespace*(name: string, level = lvlInfo): LoggingNamespace =
   return initLoggingNamespace(name, level, name & ": ")
 
-proc setLevelForNamespace*(namespace: string, lvl: Level) =
-  let found = knownNamespaces.filterIt(it.name == namespace)
-  for ns in found: ns.level = lvl
+proc getLoggerForNamespace*(namespace: string, level = lvlInfo): LoggingNamespace =
+  if knownNamespaces.hasKey(namespace): return knownNamespaces[namespace]
+  else: return initLoggingNamespace(namespace, level)
+
+proc setLevelForNamespace*(namespace: string, lvl: Level, recursive = false) =
+  if recursive:
+    for k, v in knownNamespaces.pairs:
+      if k.startsWith(namespace):
+        v.level = lvl
+  elif knownNamespaces.hasKey(namespace): knownNamespaces[namespace].level = lvl
 
 proc name*(ns: LoggingNamespace): string = ns.name
 proc log*(ns: LoggingNamespace, level: Level, args: varargs[string, `$`]) =
