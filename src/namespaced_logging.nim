@@ -39,7 +39,7 @@ proc getLoggerForNamespace*(
     if msgPrefix.isSome:
       return initLoggingNamespace(namespace, level, msgPrefix.get)
     else:
-      return initLoggingNamespace(namespace, level, namespace)
+      return initLoggingNamespace(namespace, level, namespace & ": ")
 
 proc setLevelForNamespace*(namespace: string, lvl: Level, recursive = false) =
   if recursive:

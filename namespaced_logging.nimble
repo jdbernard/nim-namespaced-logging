@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.3.0"
+version       = "0.3.1"
 author        = "Jonathan Bernard"
 description   = "Wrapper around std/logging to provide namespaced logging."
 license       = "MIT"
