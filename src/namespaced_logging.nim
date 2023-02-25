@@ -15,7 +15,12 @@ template knownNamespaces(): TableRef[string, LoggingNamespace] =
     knownNamespacesInst = newTable[string, LoggingNamespace]()
   knownNamespacesInst
 
-proc initLoggingNamespace(name: string, level = lvlInfo, msgPrefix: string): LoggingNamespace =
+proc initLoggingNamespace(
+    name: string,
+    level = lvlInfo,
+    msgPrefix: string
+  ): LoggingNamespace {.raises: [].} =
+
   result = LoggingNamespace(
     name: name,
     level: level,
@@ -27,21 +32,27 @@ proc getLoggerForNamespace*(
     namespace: string,
     level = lvlInfo,
     msgPrefix: Option[string] = none[string]()
-  ): LoggingNamespace =
+  ): LoggingNamespace {.raises: [].} =
   ## Get a LogginNamesapce for the given namespace. The first time this is
   ## called for a given name space a new logger will be created. In that case,
   ## the optional `level` and `msgPrefix` will be used to configure the logger.
   ## In all other cases, these paratmers are ignored and the existing namespace
   ## instance is returned
 
-  if knownNamespaces.hasKey(namespace): return knownNamespaces[namespace]
+  if knownNamespaces.hasKey(namespace):
+    try: return knownNamespaces[namespace]
+    except KeyError:
+      try: error "namespaced_logging: Impossible error. " &
+        "knownNamespaces contains " & namespace & " but raised a KeyError " &
+        "trying to access it."
+      except: discard
   else:
     if msgPrefix.isSome:
       return initLoggingNamespace(namespace, level, msgPrefix.get)
     else:
       return initLoggingNamespace(namespace, level, namespace & ": ")
 
-proc setLevelForNamespace*(namespace: string, lvl: Level, recursive = false) =
+proc setLevelForNamespace*(namespace: string, lvl: Level, recursive = false) {.raises: [] .} =
   if recursive:
     for k, v in knownNamespaces.pairs:
       if k.startsWith(namespace):
@@ -49,11 +60,13 @@ proc setLevelForNamespace*(namespace: string, lvl: Level, recursive = false) =
   else: getLoggerForNamespace(namespace).level = lvl
 
 proc name*(ns: LoggingNamespace): string = ns.name
-proc log*(ns: LoggingNamespace, level: Level, args: varargs[string, `$`]) =
-  if level >= ns.level:
-    if not ns.msgPrefix.isEmptyOrWhitespace:
-      log(level, args.mapIt(ns.msgPrefix & it))
-    else: log(level, args)
+proc log*(ns: LoggingNamespace, level: Level, args: varargs[string, `$`]) {.raises: [] .} =
+  try:
+    if level >= ns.level:
+      if not ns.msgPrefix.isEmptyOrWhitespace:
+        log(level, args.mapIt(ns.msgPrefix & it))
+      else: log(level, args)
+  except: discard
 
 proc debug*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlDebug, args)
 proc info*(ns: LoggingNamespace, args: varargs[string, `$`]) = log(ns, lvlInfo, args)
