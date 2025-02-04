@@ -14,7 +14,7 @@ type
 
   LogServiceConfig* = object
     loggers*: seq[LoggerConfig]
-    appenders: seq[LogAppender]
+    appenders*: seq[LogAppender]
     rootLevel*: Level
 
   ThreadState = object
@@ -155,7 +155,7 @@ func formatJsonStructuredLog*(msg: LogMessage): string {.gcsafe.} = return $(%ms
 
 func initConsoleLogAppender*(
     namespace = "",
-    threshold = lvlInfo,
+    threshold = lvlAll,
     formatter = formatJsonStructuredLog,
     useStderr = false): ConsoleLogAppender {.gcsafe.} =
   result = ConsoleLogAppender(
