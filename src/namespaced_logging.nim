@@ -52,6 +52,9 @@ type
       ## console.
     useStderr*: bool
 
+  CustomLogAppender* = ref object of LogAppender
+    doLogMessage*: proc (msg: LogMessage) {.gcsafe.}
+
   #[
   # TODO: need to think throudh thread-safe IO for file logging
   FileLogAppender* = ref object of LogAppender
@@ -74,6 +77,12 @@ method initThreadCopy*(cla: ConsoleLogAppender): LogAppender {.gcsafe.} =
     formatter: cla.formatter,
     useStderr: cla.useStdErr)
 
+
+method initThreadCopy*(cla: CustomLogAppender): LogAppender {.gcsafe.} =
+  result = CustomLogAppender(
+    namespace: cla.namespace,
+    threshold: cla.threshold,
+    doLogMessage: cla.doLogMessage)
 
 #[
 method initThreadCopy*(fla: FileLogAppender): LogAppender {.gcsafe.} =
@@ -165,6 +174,16 @@ func initConsoleLogAppender*(
     useStderr: useStdErr)
 
 
+func initCustomLogAppender*(
+    namespace = "",
+    threshold = lvlAll,
+    doLogMessage: proc (msg: LogMessage) {.gcsafe.}): CustomLogAppender {.gcsafe.} =
+  result = CustomLogAppender(
+    namespace: namespace,
+    threshold: threshold,
+    doLogMessage: doLogMessage)
+
+
 method appendLogMessage*(appender: LogAppender, msg: LogMessage): void {.base, gcsafe.} =
   raise newException(CatchableError, "missing concrete implementation")
 
@@ -179,6 +198,12 @@ method appendLogMessage*(cla: ConsoleLogAppender, msg: LogMessage): void {.gcsaf
   else:
     stdout.writeLine(strMsg)
     stdout.flushFile()
+
+
+method appendLogMessage*(cla: CustomLogAppender, msg: LogMessage): void {.gcsafe.} =
+  if msg.level < cla.threshold: return
+
+  cla.doLogMessage(msg)
 
 
 proc getLogger*(
@@ -201,16 +226,57 @@ proc getLogger*(
   else: return some(getLogger(ls.get, name, threshold))
 
 
+proc setThreshold*(ls: LogService, name: string, threshold: Level) {.gcsafe.} =
+  ## Set the logging threshold for a logger and reload the thread state. This
+  ## will affect the logger's thread-local copy, so you don't need to call
+  ## `reloadThreadState` to make the change effective for the current thread,
+  ## but in a multi-threaded context other pre-existing threads will not see
+  ## the change until they reload their state.
+  acquire(ls.lock)
+  var idx = -1
+  for i in 0 ..< ls.cfg.loggers.len:
+    if ls.cfg.loggers[i].name == name:
+      idx = i
+      break
+  if idx == -1:
+    ls.cfg.loggers.add(LoggerConfig(name: name, threshold: some(threshold)))
+  else:
+    ls.cfg.loggers[idx].threshold = some(threshold)
+  release(ls.lock)
+  reloadThreadState(ls)
+
+
 proc addAppender*(ls: LogService, appender: LogAppender) {.gcsafe.} =
+  ## Add a log appender to the log service. This will affect the logger's
+  ## thread-local copy, so you don't need to call `reloadThreadState` to make
+  ## the change effective for the current thread, but in a multi-threaded
+  ## context other pre-existing threads will not see the change until they
+  ## reload their state.
   acquire(ls.lock)
   ls.cfg.appenders.add(appender)
   release(ls.lock)
+  reloadThreadState(ls)
+
+
+proc clearAppenders*(ls: LogService) {.gcsafe.} =
+  ## Clear all log appenders from the log service. This will affect the
+  ## logger's thread-local copy, so you don't need to call `reloadThreadState`
+  ## to make the change effective for the current thread, but in a multi-threaded
+  ## context other pre-existing threads will not see the change until they
+  ## reload their state.
+  acquire(ls.lock)
+  ls.cfg.appenders = @[]
+  release(ls.lock)
+  reloadThreadState(ls)
 
 
 func `<`(a, b: LoggerConfig): bool = a.name < b.name
 
 
 func getEffectiveLevel(ts: ThreadState, name: string): Level {.gcsafe.} =
+  ## Get the effective logging level for a logger. This is the most specific
+  ## level that is set for the logger or any of its parents. The root logger
+  ## is used as the default if no other level is set.
   result = ts.cfg.rootLevel
 
   var namespaces = toSeq(values(ts.loggers))
