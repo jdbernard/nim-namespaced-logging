@@ -58,7 +58,7 @@ dbLogger.debug(%*{
 import namespaced_logging
 
 # Manually creating a LogService. This is an independent logging root fully
-# isolated from subsequent LogServices initialized
+# isolated from subsequent LogServices initialized with initLogService
 var ls = initLogService()
 
 # Configure logging
@@ -221,9 +221,9 @@ to files associated with the *FileLogAppender* configured for the current
 `namespaced_logging` does not currently have built-in logic for file
 rotation, but it does play nice with external file rotation strategies. We do
 not hold open file handles. The *FileLogAppender* attempts to batch messages
-by destination file, opens the file with fmAppend, writes the current batch of
-log messages, and then closes the file handle. Because of this, it has no
-problem if another process moves or truncates any of the target log files.
+by destination file, opens the file with mode `fmAppend`, writes the current
+batch of log messages, and then closes the file handle. Because of this, it has
+no problem if another process moves or truncates any of the target log files.
 
 ### CustomLogAppender
 
@@ -244,7 +244,7 @@ for the custom functionality.
 *TODO: rethink this. I chose this to avoid GC-safety issues copying closures
 across threads, but maybe I don't need this separate, explicit state field.*
 
-> [!IMPORTANT] The `state` data type must support copy semantics on assignment.
+> [!WARNING] The `state` data type must support copy semantics on assignment.
 > It is possible to pass a `ref` to `state` and/or data structures that include
 > `ref`s, but **you must guarantee they remain valid**, either by allocating
 > shared memeory, or (preferably) keeping alive a reference to them that the GC
@@ -303,36 +303,11 @@ initialization context is separated from the logging setup code.
 
 ### Overview
 
-The namespaced logging library is built around a thread-safe architecture that
-attempts to balance performance, safety, and usability in multithreaded
-environments. The design centers on two key types (*LogService* and
-*ThreadLocalLogService*) that work together to provide both thread-safe
-configuration management and efficient logging operations.
+The namespaced logging library attempts to balance performance, safety, and
+usability in multithreaded environments. The design centers on two key types:
+*LogService* and *ThreadLocalLogService*.
 
-### Core Architecture Components
-
-#### GlobalLogService (Internal)
-
-At the heart of the system is the `GlobalLogService`, a heap-allocated object
-that serves as the single source of truth for logging configuration. This
-internal type is not exposed to library users but manages:
-
-- **Shared configuration state**: Appenders, thresholds, and root logging level
-- **Synchronization primitives**: Locks and atomic variables for thread
-  coordination
-- **Background I/O threads**: Dedicated writer threads for console and file
-  output
-- **Configuration versioning**: Atomic version numbers for efficient change
-  detection
-
-The `GlobalLogService` ensures that configuration changes are safely propagated
-across all threads while maintaining high performance for logging operations.
-
-#### LogService vs ThreadLocalLogService
-
-The library exposes two distinct types for different usage patterns:
-
-##### LogService (Value Type)
+#### LogService (Value Type)
 ```nim
 type LogService* = object
   configVersion: int
@@ -355,24 +330,41 @@ The *LogService* object is intended to support uses cases such as:
 > The *LogService* object is the object that is intended to be shared across
 > threads.
 
-##### ThreadLocalLogService (Reference Type)
+#### ThreadLocalLogService (Reference Type)
 ```nim
 type ThreadLocalLogService* = ref LogService
 ```
 
-The *ThreadLocalLogService* is a reference to a thread-local copy of a
-*LogService* and can be obtained via *threadLocalRef*. We purposefully use
-reference semantics within the context of a thread so that *Logger* objects
-created within the same thread context share the same *ThreadLocalLogService*
+*ThreadLocalLogService* is a reference to a thread-local copy of a *LogService*
+and can be obtained via *threadLocalRef*. We purposefully use reference
+semantics within the context of a thread so that *Logger* objects created
+within the same thread context share the same *ThreadLocalLogService*
 reference, avoiding the need to synchronize every *Logger* individually.
 
-The *ThreadLocalLogService* is the object that users are expected to interact
-with during regular operation and support both the configuration functions of
+*ThreadLocalLogService* is the object that users are expected to interact with
+during regular operation and support both the configuration functions of
 *LogService* and the creation of *Logger* objects.
 
 > [!CAUTION]
 > *ThreadLocalLogService* objects should **never** be shared outside the
 > context of the thread in which they were initialized.
+
+#### GlobalLogService (Internal)
+
+Under the hood *LogService* holds a reference to a *GlobalLogService*, a
+heap-allocated object that serves as the single source of truth for logging
+configuration. This internal type is not exposed to library users but manages:
+
+- **Shared configuration state**: Appenders, thresholds, and root logging level
+- **Synchronization primitives**: Locks and atomic variables for thread
+  coordination
+- **Background I/O threads**: Dedicated writer threads for console and file
+  output
+- **Configuration versioning**: Atomic version numbers for efficient change
+  detection
+
+The `GlobalLogService` ensures that configuration changes are safely propagated
+across all threads while maintaining high performance for logging operations.
 
 ### Thread Safety Model
 
@@ -419,14 +411,16 @@ proc ensureFreshness*(ls: var LogService) =
     # Sync state...
 ```
 
-This design ensures that:
-- **Hot path is fast**: Most logging operations skip expensive synchronization
-- **Changes propagate automatically**: All threads see configuration updates
-- **Minimal lock contention**: Locks only acquired when configuration changes
+Goals/Motivation:
+- Most logging operations skip expensive synchronization so the hot path is
+  fast.
+- Propogate changes automatically so all threads see configuration updates.
+- Minimize lock contention by only acquiring when configuration changes
 
 #### Thread-Local Caching
 
-Each thread maintains its own copy of the logging configuration:
+Each thread maintains its own copy of the logging configuration in
+*ThreadLocalLogService*:
 
 - **Appenders**: Thread-local copies created via `clone()` method
 - **Thresholds**: Complete copy of namespace-to-level mappings
