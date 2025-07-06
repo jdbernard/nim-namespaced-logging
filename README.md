@@ -44,11 +44,12 @@ let dbLogger = getLogger("app/db/queryplanner")
 dbLogger.debug("Beginning query plan...")
 
 # native support for structured logs (import std/json)
-dbLogger.debug(%{
+dbLogger.debug(%*{
   "method": "parseParams",
   "message": "unrecognized param type",
-  "invalidType": params[idx].type
-})
+  "invalidType": $params[idx].type,
+  "metadata": %(params.meta)
+} )
 ```
 
 ### Manual Configuration
@@ -69,6 +70,33 @@ let localLogSvc = threadLocalRef(ls)
 let apiLogger = localLogSvc.getLogger("api")
 let dbLogger = localLogSvc.getLogger("db")
 ```
+
+### Autoconfigured Multithreaded Application
+```nim
+import namespaced_logging/autoconfigured
+import mummy, mummy/routers
+
+# Main thread setup
+addLogAppender(initConsoleLogAppender())
+
+proc createApiRouter*(apiCtx: ProbatemApiContext): Router =
+  # This will run on a separate thread, but the thread creation is managed by
+  # mummy, not us. Log functions still operate correctly and respect the
+  # configuration setup on the main thread
+  let logger = getLogger("api")
+  logger.trace(%*{ "method_entered": "createApiRouter" })
+
+  # API route setup...
+
+  logger.debug(%*{ "method": "createApiRouter", "routes": numRoutes })
+
+
+let server = newServer(createApiRouter(), workerThreads = 4)
+info("Serving MyApp v1.0.0 on port 8080")
+
+setThreshold("api", lvlTrace) # will be picked up by loggers on worker threads
+```
+
 
 ### Manual Multithreaded Application
 ```nim
