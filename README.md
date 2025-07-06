@@ -1,21 +1,22 @@
 # Namespaced Logging for Nim
 
-`namespaced_logging` provides a high-performance, thread-safe logging framework
-similar to [std/logging][std-logging] with support for namespace-scoped logging
-similar to [log4j][] or [logback][] for Nim. It has four main motivating
-features:
+`namespaced_logging` is intended to be a high-performance, thread-safe logging
+framework similar to [std/logging][std-logging] with support for
+namespace-scoped logging similar to [log4j][] or [logback][] for Nim. It has
+four main motivating features:
 - Hierarchical, namespaced logging
 - Safe and straightforward to use in multi-threaded applications.
 - Native support for structured logging.
-- Simple, autoconfigured usage pattern mirroring the [std/logging][std-logging]
-  interface.
+- Simple, autoconfigured usage pattern reminiscent of the
+  [std/logging][std-logging] interface.
 
 ## Getting Started
 
-Install the package from nimble:
+Install the package via nimble:
 
 ```bash
-nimble install namespaced_logging
+# Not yet in official Nim packages. TODO once we've battle-tested it a little
+nimble install https://github.com/jdbernard/nim-namespaced-logging
 ```
 
 ## Usage Patterns
@@ -92,6 +93,7 @@ proc createApiRouter*(apiCtx: ProbatemApiContext): Router =
 
 
 let server = newServer(createApiRouter(), workerThreads = 4)
+ctx.server.serve(Port(8080))
 info("Serving MyApp v1.0.0 on port 8080")
 
 setThreshold("api", lvlTrace) # will be picked up by loggers on worker threads
