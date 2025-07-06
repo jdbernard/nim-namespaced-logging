@@ -440,7 +440,7 @@ proc log*(l: Logger, lvl: Level, msg: JsonNode) {.gcsafe.} =
     error: none[ref Exception](),
     timestamp: now(),
     message:
-      if msg.hasKey("msg"): msg["msg"].getStr
+      if msg.hasKey("message"): msg["message"].getStr
       else: "",
     additionalData: msg))
 
