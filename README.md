@@ -162,6 +162,97 @@ loggers upwards in the scope naming heirarchy. This pattern is explained in
 detail in the [logback documentation][effective logging level] and applies in
 the same manner to loggers in this library.
 
+### LogMessageFormater
+
+Both the [ConsoleLogAppender](#ConsoleLogAppender) and
+[FileLogAppender](#FileLogAppender) can be given a *LogMessageFormatter* to
+determine how a log message is formatted before being written.
+
+```nim
+type LogMessageFormatter* = proc (msg: LogMessage): string {.gcsafe.}
+```
+
+## Available Appenders
+
+### ConsoleLogAppender
+
+Used for writing logs to stdout or stderr.
+
+```nim
+proc initConsoleLogAppender*(
+    formatter = formatSimpleTextLog,
+      ## formatJsonStructuredLog is another useful formatter provided
+      ## or you can write your own
+    useStderr = false,  ## stdout is used by default
+    namespace = "",     ## appender matches all scopes by default
+    threshold = lvlAll  ## and accepts all message levels by default
+  ): ConsoleLogAppender {.gcsafe.}
+```
+
+The first time a message is sent to any *ConsoleLogAppender*, we create a
+writer thread which writes messages to the specified output in the order they
+are received, flushing the file handle after each write to enforce an ordering.
+The ConsoleLogAppender implementation uses a channel to send messages to the
+writer thread.
+
+### FileLogAppender
+
+Used for writing logs to files.
+
+```nim
+proc initFileLogAppender*(
+    filePath: string,
+    formatter = formatSimpleTextLog,
+      ## formatJsonStructuredLog is another useful formatter provided
+      ## or you can write your own
+    namespace = "",
+    threshold = lvlAll
+  ): FileLogAppender {.gcsafe.}
+
+```
+
+Similar to the *ConsoleLogAppender* implementation, the first time a message is
+sent to any *FileLogAppender* we create a writer thread which writes messages
+to files associated with the *FileLogAppender* configured for the current
+*LogService*.
+
+`namespaced_logging` does not currently have built-in logic for file
+rotation, but it does play nice with external file rotation strategies. We do
+not hold open file handles. The *FileLogAppender* attempts to batch messages
+by destination file, opens the file with fmAppend, writes the current batch of
+log messages, and then closes the file handle. Because of this, it has no
+problem if another process moves or truncates any of the target log files.
+
+### CustomLogAppender
+
+Provides an extension point for custom logging implementations.
+
+```nim
+func initCustomLogAppender*[T](
+    state: T,   # arbitrary state needed for the appender
+    doLogMessage: CustomLogAppenderFunc[T],
+      # custom log appender implementation
+    namespace = "",
+    threshold = lvlAll): CustomLogAppender[T] {.gcsafe.} =
+```
+
+The `state` field allows you to explicitly pass in any data that is required
+for the custom functionality.
+
+*TODO: rethink this. I chose this to avoid GC-safety issues copying closures
+across threads, but maybe I don't need this separate, explicit state field.*
+
+> [!IMPORTANT] The `state` data type must support copy semantics on assignment.
+> It is possible to pass a `ref` to `state` and/or data structures that include
+> `ref`s, but **you must guarantee they remain valid**, either by allocating
+> shared memeory, or (preferably) keeping alive a reference to them that the GC
+> is aware of, either on the thread where they were initialized or by
+> explicitly telling the GC about the cross-thread reference *(TODO: how?)*.
+
+See [testutil][] and the unit tests in [namespaced\_logging][nsl-unit-tests]
+for an example.
+
+
 ## Notes on Use in Multi-Threaded Applications
 
 The loggers and appenders in this library are thread-safe and are intended to
@@ -169,26 +260,6 @@ behave more intuitively in a multi-threaded environment than
 [std/logging][std-logging] while presenting a similar API. This is particularly
 true in environments where the logging setup code may be separated from the
 thread-management code (in an HTTP server, for example).
-
-The *LogService* object is the main entry point for the logging system and
-should be initialized on the main thread. The *LogService* contains the "source
-of truth" for logging configuration and is safe to be shared between all threads.
-Internally all access to the shared *LogService* configuration is protected by
-a mutex.
-
-Individual threads should use the *threadLocalRef* proc to obtain a
-*ThreadLocalLogService* reference that can be used to create *Logger* objects.
-*ThreadLocalLogService* objects cache the global *LogService* state locally to
-avoid expensive locks on the shared state. Instead an atomic configuration
-version number is maintained to allow the thread-local state to detect global
-configuration changes via an inexpensive [load][atomic-load] call and
-automatically synchronize only when necessary.
-
-This thread-local caching mechanism is the primary advantage of this logging
-system over std/logging in a multi-threaded environment as it means that
-the logging system itself is responsible for making sure appenders are
-configured for every thread where loggers are used, even if the thread
-initialization context is separated from the logging setup code.
 
 As described in the [Getting Started](#getting-started) section, you can use
 the `namespaced_logging/autoconfigured` import to use a simplified interface
@@ -205,6 +276,25 @@ that thread goes out of scope while other threads are still running and using
 the *LogService*, the global state may be harvested by the garbage collector,
 leading to use-after-free errors when other threads attempt to log (likely
 causing segfaults).
+
+When managing the state yourself, the *LogService* object is the main entry
+point for the logging system and should be initialized on the main thread. The
+*LogService* contains a reference to the "source of truth" for logging
+configuration and is safe to be shared between all threads.
+
+Individual threads should use the *threadLocalRef* proc to obtain a
+*ThreadLocalLogService* reference that can be used to create *Logger* objects.
+*ThreadLocalLogService* objects cache the global *LogService* state locally to
+avoid expensive locks on the shared state. Instead an atomic configuration
+version number is maintained to allow the thread-local state to detect global
+configuration changes via an inexpensive [load][atomic-load] call and
+automatically synchronize only when necessary.
+
+This thread-local caching mechanism is the primary advantage of this logging
+system over std/logging in a multi-threaded environment as it means that
+the logging system itself is responsible for making sure appenders are
+configured for every thread where loggers are used, even if the thread
+initialization context is separated from the logging setup code.
 
 
 ## Architectural Design
@@ -349,13 +439,12 @@ This caching strategy provides:
 
 ### Overview
 
-The namespaced logging library implements a callback-based error handling system
-designed to gracefully handle failures that may occur during logging
-operations. Since logging is typically a non-critical operation, the library
-prioritizes application stability over guaranteed log delivery, but provides
-mechanisms for applications to monitor and respond to logging failures.
+For errors that occur during logging operations, there is a callback-based
+error handling system designed to attempt to gracefully handle such failures.
+Since logging is typically a non-critical operation we prioritize application
+stability over guaranteed log delivery.
 
-### Error Handler Pattern
+### Error Handler
 
 The library uses a callback-based error handling pattern where applications can
 register custom error handlers to be notified when logging operations fail. The
@@ -367,44 +456,15 @@ error handler receives:
 type ErrorHandlerFunc* = proc(error: ref Exception, msg: string) {.gcsafe, nimcall.}
 ```
 
-#### Thread-Safe Error Reporting
-All error handling is thread-safe and uses a separate lock to prevent deadlocks:
+### Default Error Handler
 
-```nim
-proc reportLoggingError(gls: GlobalLogService, err: ref Exception, msg: string) =
-  var handler: ErrorHandlerFunc
+namespaced\_logging uses the `defaultErrorHandlerFunc` if a custom error
+handler has not been configured. The default handler:
 
-  # Quickly grab the handler under lock
-  withLock gls.errorHandlerLock:
-    handler = gls.errorHandler
-
-  # Call handler outside the lock to avoid blocking other threads
-  if not handler.isNil:
-    try: handler(err, msg)
-    except:
-      # If custom handler fails, fall back to default
-      try: defaultErrorHandlerFunc(err, msg)
-      except Exception: discard
-```
-
-### Default Error Handling
-
-#### Default Behavior
-When no custom error handler is configured, the library uses `defaultErrorHandlerFunc`, which:
-
-1. **Attempts to write to stderr**: Most likely to be available and monitored
-2. **Includes full context**: Error message, stack trace, and context
-3. **Fails silently**: If stderr is unavailable, gives up gracefully
-
-```nim
-proc defaultErrorHandlerFunc*(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-  try:
-    stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
-    stderr.writeLine($err.getStackTrace())
-    stderr.flushFile()
-  except Exception:
-    discard # If we can't write to stderr, there's nothing else we can do
-```
+1. Attempts to write to stderr, assuming it is likely to be available and monitored
+2. Writes an error message and includes both the exception message and stack
+   trace (not available in release mode).
+3. Fails silently if it is unable to write to to stderr.
 
 ### Configuration
 
@@ -429,88 +489,6 @@ proc silentErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
 logService.setErrorHandler(silentErrorHandler)
 ```
 
-### Error Handling Examples
-
-#### Example 1: Monitoring and Metrics
-```nim
-import std/atomics
-
-var errorCount: Atomic[int]
-var lastError: string
-
-proc monitoringErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-  errorCount.atomicInc()
-  lastError = msg & ": " & err.msg
-
-  # Still log to stderr for immediate visibility
-  try:
-    stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
-    stderr.flushFile()
-  except: discard
-
-# Usage
-let logService = initLogService(errorHandler = monitoringErrorHandler)
-
-# Later, check error status
-if errorCount.load() > 0:
-  echo "Warning: ", errorCount.load(), " logging errors occurred"
-  echo "Last error: ", lastError
-```
-
-#### Example 2: Alternative Logging Destination
-```nim
-proc fileErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-  try:
-    var f: File
-    if open(f, "logging_errors.log", fmAppend):
-      f.writeLine($now() & " [" & msg & "]: " & err.msg)
-      f.writeLine($err.getStackTrace())
-      f.writeLine("---")
-      f.close()
-  except:
-    # If file logging fails, fall back to stderr
-    try:
-      stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
-      stderr.flushFile()
-    except: discard
-
-let logService = initLogService(errorHandler = fileErrorHandler)
-```
-
-#### Example 3: Development vs Production
-```nim
-proc createErrorHandler(isDevelopment: bool): ErrorHandlerFunc =
-  if isDevelopment:
-    # Verbose error reporting for development
-    proc devErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-      stderr.writeLine("=== LOGGING ERROR ===")
-      stderr.writeLine("Context: " & msg)
-      stderr.writeLine("Error: " & err.msg)
-      stderr.writeLine("Stack Trace:")
-      stderr.writeLine($err.getStackTrace())
-      stderr.writeLine("====================")
-      stderr.flushFile()
-
-    return devErrorHandler
-  else:
-    # Minimal error reporting for production
-    proc prodErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-      try:
-        var f: File
-        if open(f, "/var/log/myapp/logging_errors.log", fmAppend):
-          f.writeLine($now() & " " & msg & ": " & err.msg)
-          f.close()
-      except: discard
-
-    return prodErrorHandler
-
-# Usage
-when defined(release):
-  let logService = initLogService(errorHandler = createErrorHandler(false))
-else:
-  let logService = initLogService(errorHandler = createErrorHandler(true))
-```
-
 ### Best Practices
 
 #### Provide Fallbacks
@@ -528,24 +506,15 @@ proc robustErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
 ```
 
 #### Keep Error Handlers Simple
-```nim
-# Good: Simple and focused
-proc simpleErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-  errorCounter.atomicInc()
-  try:
-    stderr.writeLine("LOG ERROR: " & msg)
-    stderr.flushFile()
-  except: discard
 
-# Avoid: Complex operations that might themselves fail
-proc complexErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
-  # Don't do heavy operations like database writes,
-  # complex network operations, or file system operations
-  # that might fail and cause cascading errors
-```
+As much as possible, avoid complex operations that might themselves fail.
+Don't do heavy operations like database writes, complex network operations, or
+file system operations that might fail and cause cascading errors.
 
 [log4j]: https://logging.apache.org/log4j/2.x/
 [logback]: https://logback.qos.ch/
 [effective logging level]: https://logback.qos.ch/manual/architecture.html#effectiveLevel
 [atomic-load]: https://nim-lang.org/docs/atomics.html#load%2CAtomic%5BT%5D%2CMemoryOrder
 [std-logging]: https://nim-lang.org/docs/logging.html
+[testutil]: /blob/main/src/namespaced_logging/testutil.nim
+[nsl-unit-tests]: https://github.com/jdbernard/nim-namespaced-logging/blob/main/src/namespaced_logging.nim#L904
