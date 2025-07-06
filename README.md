@@ -1,11 +1,14 @@
 # Namespaced Logging for Nim
 
-`namespaced_logging` provides a logging framework similar to [log4j][] or
-[logback][] for Nim. It has three main motivating features:
+`namespaced_logging` provides a high-performance, thread-safe logging framework
+similar to [std/logging][std-logging] with support for namespace-scoped logging
+similar to [log4j][] or [logback][] for Nim. It has four main motivating
+features:
 - Hierarchical, namespaced logging
 - Safe and straightforward to use in multi-threaded applications.
-- Native support for structured logging (old-style string logging is also
-  supported).
+- Native support for structured logging.
+- Simple, autoconfigured usage pattern mirroring the [std/logging][std-logging]
+  interface.
 
 ## Getting Started
 
@@ -15,22 +18,92 @@ Install the package from nimble:
 nimble install namespaced_logging
 ```
 
-Then, in your application, you can use the logging system like so:
+## Usage Patterns
 
+### Simple, Autoconfigured Setup
+```nim
+import namespaced_logging/autoconfigured
+
+# Zero configuration of the LogService required, appender/logger configuration
+# is immediately available
+addLogAppender(initConsoleLogAppender())
+info("Application started")
+
+# Set global threshold
+setRootLoggingThreshold(lvlWarn)
+
+# Namespaced loggers, thresholds, and appenders supported
+addLogAppender(initFileLogAppender(
+  filePath = "/var/log/app_db.log",
+  formatter = formatJsonStructuredLog, # provided in namespaced_logging
+  namespace = "app/db",
+  threshold = lvlInfo))
+
+# in DB code
+let dbLogger = getLogger("app/db/queryplanner")
+dbLogger.debug("Beginning query plan...")
+
+# native support for structured logs (import std/json)
+dbLogger.debug(%{
+  "method": "parseParams",
+  "message": "unrecognized param type",
+  "invalidType": params[idx].type
+})
+```
+
+### Manual Configuration
 ```nim
 import namespaced_logging
 
-# On the main thread
-let logService = initLogService()
-logService.addAppender(initConsoleAppender(LogLevel.INFO))
+# Manually creating a LogService. This is an independent logging root fully
+# isolated from subsequent LogServices initialized
+var ls = initLogService()
 
-# On any thread, including the main thread
-let logger = logService.getLogger("app/service/example")
-logger.info("Log from the example service")
+# Configure logging
+ls.addAppender(initConsoleLogAppender())
+ls.addAppender(initFileLogAppender("app.log"))
+ls.setThreshold("api", lvlWarn)
 
-# Only get logs at the WARN or higher level from the database module
-let logger = logService.getLogger("app/database", threshold = some(Level.lvlWarn))
-logger.error("Database connection failed")
+# Create loggers
+let localLogSvc = threadLocalRef(ls)
+let apiLogger = localLogSvc.getLogger("api")
+let dbLogger = localLogSvc.getLogger("db")
+```
+
+### Manual Multithreaded Application
+```nim
+import namespaced_logging
+
+# Main thread setup
+var logService = initLogService()
+logService.addAppender(initConsoleLogAppender())
+
+var localLogSvc = threadLocalRef(logService) # for use on main thread
+
+# Worker thread function
+proc worker(ls: LogService) {.thread.} =
+  let localLogSvc = threadLocalRef(ls)
+  let logger = localLogSvc.getLogger("worker")
+
+  # Runtime configuration changes
+  localLogSvc.setThreshold("worker", lvlDebug)
+  logger.debug("Worker configured")
+
+# Safe thread creation
+createThread(workerThread, worker, logService)
+```
+
+### Dynamic Configuration
+```nim
+# Configuration can change at runtime
+proc configureLogging(localLogSvc: ThreadLocalLogService, verbose: bool) =
+  if verbose:
+    localLogSvc.setRootThreshold(lvlDebug)
+    localLogSvc.addAppender(initFileLogAppender("debug.log"))
+  else:
+    localLogSvc.setRootThreshold(lvlInfo)
+
+# Changes automatically propagate to all threads
 ```
 
 ## Loggers and Appenders
@@ -43,140 +116,408 @@ threshold, which determines which log events are acted upon by the appender,
 and, optionally, a namespace filter, which determines from which loggers the
 appender accepts log events.
 
-### Heirarchical Logging and Namespaces
+### Heirarchical Logging Namespaces
 
 Loggers are organized hierarchically, with the hierarchy defined by the logger
-name. A logger with the name `app/service/example` is a child of the logger
-with the name `app/service`. By default, appenders accept log events from all
-loggers, but this can be restricted by setting a namespace filter on the
-appender. An appender with a namespace set will accept log events from all
-loggers with names that start with the namespace. For example, an appender with
-the namespace `app` will accept log events from the loggers `app`,
-`app/service`, and `app/service/example`, but not from `api/service`.
+scope. A logger with the scope `app/service/example` is conceptually a child of
+the logger with the scope `app/service`. By default, appenders accept log
+events from all loggers, but this can be restricted by setting a namespace
+filter on the appender. An appender with a namespace set will accept log events
+from all loggers with scopes that start with the namespace. For example, an
+appender with the namespace `app` will accept log events from the loggers
+`app`, `app/service`, and `app/service/example`, but not from `api/service`.
 
 The other impact of the logger heirarchy is in the effective logging level of
-the logger. Any logger can have an explicit logging level set, but if it does
-not, the effective logging level is inherited from ancestor loggers upwards in
-the logger heirarchy. This pattern is explained in detail in the [logback
-documentation][effective logging level] and applies in the same manner to
-loggers in this library.
-
+the logger. An explicit logging level threshold can be set for any scope. Any
+scope that does not have an explicit inherits its threshold from ancestor
+loggers upwards in the scope naming heirarchy. This pattern is explained in
+detail in the [logback documentation][effective logging level] and applies in
+the same manner to loggers in this library.
 
 ## Notes on Use in Multi-Threaded Applications
 
-The loggers and appenders in this library are thread-safe and behaves more
-intuitively in a multi-threaded environment than `std/logging`, particularly in
-environments where the logging setup code may be separated from the
+The loggers and appenders in this library are thread-safe and are intended to
+behave more intuitively in a multi-threaded environment than
+[std/logging][std-logging] while presenting a similar API. This is particularly
+true in environments where the logging setup code may be separated from the
 thread-management code (in an HTTP server, for example).
 
 The *LogService* object is the main entry point for the logging system and
 should be initialized on the main thread. The *LogService* contains the "source
-of truth" for logging configuration and is shared between all threads.
-Internally all access to the *LogService* is protected by a mutex.
+of truth" for logging configuration and is safe to be shared between all threads.
+Internally all access to the shared *LogService* configuration is protected by
+a mutex.
 
-Logging can be very noisy and if the *LogService* needed to be consulted for
-every log event, it could easily become a performance bottleneck. To avoid
-this, the *getLogger* procedure makes a thread-local copy of the logging system
-configuration (loggers defined and appenders attached).
-
-**Note** that this means that the thread-local cache of the logging system
-configuration can become stale if the logging system configuration is changed
-after the thread-local copy is made (if another appender is added, for
-example). This is a trade-off to avoid the performance penalty of consulting
-the *LogService* for every log event.
+Individual threads should use the *threadLocalRef* proc to obtain a
+*ThreadLocalLogService* reference that can be used to create *Logger* objects.
+*ThreadLocalLogService* objects cache the global *LogService* state locally to
+avoid expensive locks on the shared state. Instead an atomic configuration
+version number is maintained to allow the thread-local state to detect global
+configuration changes via an inexpensive [load][atomic-load] call and
+automatically synchronize only when necessary.
 
 This thread-local caching mechanism is the primary advantage of this logging
-system over `std/logging` in a multi-threaded environment as it means that
+system over std/logging in a multi-threaded environment as it means that
 the logging system itself is responsible for making sure appenders are
 configured for every thread where loggers are used, even if the thread
 initialization context is separated from the logging setup code.
 
-If you find yourself needing to change the logging configuration after the
-logging system has been initialized, the *reloadThreadState* procedure can be
-used to update the thread-local cache of the logging system configuration, but
-it must be called on the thread you wish to update.
+As described in the [Getting Started](#getting-started) section, you can use
+the `namespaced_logging/autoconfigured` import to use a simplified interface
+that more closely matches the contract of [std/logging][std-logging]. In this
+case all thread and state management is done for you. The only limitation is
+that you cannot create multiple global *LogService* instances. In practice this
+is an uncommon need.
 
-As a final note, the advice to initialize the *LogService* on the main thread
-is primarily to simplify the configuration of the logging service and avoid the
-need to manually reload caches on individual threads. A *LogService* reference
-is required to call *getLogger*, but it can be created on any thread.
+If you do need or want the flexibility to manage the state yourself, import
+`namespaced_logging` directly. In this case, the thread which initialized
+*LogService* must also be the longest-living thread that uses that *LogService*
+instance. If the initializing thread terminates or the *LogService* object in
+that thread goes out of scope while other threads are still running and using
+the *LogService*, the global state may be harvested by the garbage collector,
+leading to use-after-free errors when other threads attempt to log (likely
+causing segfaults).
 
-## Custom Appender Implementations
 
-Due to the thread-safety of the logging system, there are a few additional
-considerations when implementing custom appenders. The *LogAppender* abstract
-class is the base class for all appenders. To implement a custom appender, two
-methods must be implemented:
+## Architectural Design
 
-### `appendLogMessage`
+### Overview
 
+The namespaced logging library is built around a thread-safe architecture that
+attempts to balance performance, safety, and usability in multithreaded
+environments. The design centers on two key types (*LogService* and
+*ThreadLocalLogService*) that work together to provide both thread-safe
+configuration management and efficient logging operations.
+
+### Core Architecture Components
+
+#### GlobalLogService (Internal)
+
+At the heart of the system is the `GlobalLogService`, a heap-allocated object
+that serves as the single source of truth for logging configuration. This
+internal type is not exposed to library users but manages:
+
+- **Shared configuration state**: Appenders, thresholds, and root logging level
+- **Synchronization primitives**: Locks and atomic variables for thread
+  coordination
+- **Background I/O threads**: Dedicated writer threads for console and file
+  output
+- **Configuration versioning**: Atomic version numbers for efficient change
+  detection
+
+The `GlobalLogService` ensures that configuration changes are safely propagated
+across all threads while maintaining high performance for logging operations.
+
+#### LogService vs ThreadLocalLogService
+
+The library exposes two distinct types for different usage patterns:
+
+##### LogService (Value Type)
 ```nim
-method appendLogMessage*(appender: CustomLogAppender, msg: LogMessage): void {.base, gcsafe.}
+type LogService* = object
+  configVersion: int
+  global: GlobalLogService
+  appenders: seq[LogAppender]
+  thresholds: TableRef[string, Level]
 ```
 
-This is the primary appender implementation that takes a LogMessage and
-writes it to the appender's destination. As the signature suggests, the
-implementation must be GC-safe. As a multi-method, the *CustomLogAppender* type
-should be replaced by the actual name of your custom appender.
+The *LogService* object is intended to support uses cases such as:
+- **Main thread initialization**: a mutable *LogService* supports all of the
+  configuration functions you would typically need when initializing logging
+  for an application on the main thread.
+- **Cross-thread communication**: Being an `object` type, *LogService* follows
+  value semantics and can be safely copied between threads.
+- **Service composition**: independently initialized *LogService* objects are
+  truly independent and multiple can be created and embedded in larger
+  application contexts.
 
-Because the *LogAppender* uses multi-methods for dynamic dispatch, the
-custom appender class must also be a `ref` type.
+> [!TIP]
+> The *LogService* object is the object that is intended to be shared across
+> threads.
 
-### `initThreadCopy`
-
+##### ThreadLocalLogService (Reference Type)
 ```nim
-method initThreadCopy*(app: LogAppender): LogAppender {.base, gcsafe.}
+type ThreadLocalLogService* = ref LogService
 ```
 
-This method is used to create a thread-local copy of the appender. It is called
-by the *reloadThreadState* procedure to update the thread-local cache of the
-logging system configuration. The implementation will be passed the appender
-instance that was provided to the *addAppender* procedure and must return a
-thread-local copy of that appender.
+The *ThreadLocalLogService* is a reference to a thread-local copy of a
+*LogService* and can be obtained via *threadLocalRef*. We purposefully use
+reference semantics within the context of a thread so that *Logger* objects
+created within the same thread context share the same *ThreadLocalLogService*
+reference, avoiding the need to synchronize every *Logger* individually.
 
-The `initThreadCopy` implementations for the built-in *ConsoleLogAppender* and
-*FileLogAppender* provide simple examples of how to implement this method by
-simply copying state into the local thread, but this method can also be used
-to perform any other thread-specific initialization that may be required for
-the appender implementation.
+The *ThreadLocalLogService* is the object that users are expected to interact
+with during regular operation and support both the configuration functions of
+*LogService* and the creation of *Logger* objects.
 
-### Example Custom Appender
+> [!CAUTION]
+> *ThreadLocalLogService* objects should **never** be shared outside the
+> context of the thread in which they were initialized.
 
-The following defines a simple custom appender that writes log messages to a
-database table. It uses the [waterpark][] connection pooling library to manage
-database connections as waterpark is also thread-safe and makes implementation
-straight-forward.
+### Thread Safety Model
 
+#### Safe Cross-Thread Pattern
 ```nim
-import db_connectors/db_postgres
-import namespaced_logging, waterpark, waterpark/db_postgres
+# Main thread setup
+let logService = initLogService()
+logService.addAppender(initConsoleLogAppender())
 
-type DbLogAppender = ref object of LogAppender
-  dbPool: PostgresPool
+# Safe: value semantics allow crossing thread boundaries
+proc workerThread(ls: LogService) {.thread.} =
+  # Convert to thread-local reference for efficient operations
+  let tlls = threadLocalRef(ls)
+  let logger = tlls.getLogger("worker")
+  logger.info("Worker thread started")
 
-let dbPool: PostgresPool = newPostgresPool(10, "", "", "", connectionString)
-
-method initThreadCopy*(app: LogAppender): LogAppender =
-  result = DbLogAppender(dbPool: dbPool) # copy semantics as PostgresPool is an object
-
-method appendLogMessage*(appender: DbLogAppender, msg: LogMessage): void {gcsafe.} =
-  appender.withConnection conn:
-    conn.insert(
-      "INSERT INTO log_events " &
-      "  (level, scope, message, error, timestamp, custom_fields) " &
-      "VALUES " &
-      "  (?, ?, ?, ?, ?, ?)",
-      msg.level,
-      msg.scope,
-      msg.message,
-      if msg.error.isSome: msg.error.msg
-      else: "",
-      msg.timestamp,
-      msg.additionalData)
+createThread(worker, workerThread, logService)
 ```
 
+#### Unsafe Pattern (Avoided by Design)
+```nim
+# DON'T DO THIS - unsafe reference sharing
+# ThreadLocalLogService should not be shared across threads
+let tlls = threadLocalRef(initLogService())
+createThread(worker, someProc, tlls)  # ❌ Potential GC issues
+```
 
+### Configuration Synchronization
+
+#### Atomic Version Checking
+
+The library uses atomic version numbers to efficiently detect configuration
+changes:
+
+```nim
+proc ensureFreshness*(ls: var LogService) =
+  # Cheap atomic check first
+  if ls.configVersion == ls.global.configVersion.load():
+    return  # No changes, return immediately
+
+  # Only acquire lock and copy if versions differ
+  withLock ls.global.lock:
+    ls.configVersion = ls.global.configVersion.load
+    # Sync state...
+```
+
+This design ensures that:
+- **Hot path is fast**: Most logging operations skip expensive synchronization
+- **Changes propagate automatically**: All threads see configuration updates
+- **Minimal lock contention**: Locks only acquired when configuration changes
+
+#### Thread-Local Caching
+
+Each thread maintains its own copy of the logging configuration:
+
+- **Appenders**: Thread-local copies created via `clone()` method
+- **Thresholds**: Complete copy of namespace-to-level mappings
+- **Version tracking**: Local version number for change detection
+
+This caching strategy provides:
+- **High performance**: No locks needed for normal logging operations
+- **Consistency**: All threads eventually see the same configuration
+- **Isolation**: Thread-local state prevents cross-thread interference
+
+## Error Handling
+
+### Overview
+
+The namespaced logging library implements a callback-based error handling system
+designed to gracefully handle failures that may occur during logging
+operations. Since logging is typically a non-critical operation, the library
+prioritizes application stability over guaranteed log delivery, but provides
+mechanisms for applications to monitor and respond to logging failures.
+
+### Error Handler Pattern
+
+The library uses a callback-based error handling pattern where applications can
+register custom error handlers to be notified when logging operations fail. The
+error handler receives:
+- `error`: The exception that caused the failure
+- `msg`: A descriptive message providing context about where the error occurred
+
+```nim
+type ErrorHandlerFunc* = proc(error: ref Exception, msg: string) {.gcsafe, nimcall.}
+```
+
+#### Thread-Safe Error Reporting
+All error handling is thread-safe and uses a separate lock to prevent deadlocks:
+
+```nim
+proc reportLoggingError(gls: GlobalLogService, err: ref Exception, msg: string) =
+  var handler: ErrorHandlerFunc
+
+  # Quickly grab the handler under lock
+  withLock gls.errorHandlerLock:
+    handler = gls.errorHandler
+
+  # Call handler outside the lock to avoid blocking other threads
+  if not handler.isNil:
+    try: handler(err, msg)
+    except:
+      # If custom handler fails, fall back to default
+      try: defaultErrorHandlerFunc(err, msg)
+      except Exception: discard
+```
+
+### Default Error Handling
+
+#### Default Behavior
+When no custom error handler is configured, the library uses `defaultErrorHandlerFunc`, which:
+
+1. **Attempts to write to stderr**: Most likely to be available and monitored
+2. **Includes full context**: Error message, stack trace, and context
+3. **Fails silently**: If stderr is unavailable, gives up gracefully
+
+```nim
+proc defaultErrorHandlerFunc*(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  try:
+    stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
+    stderr.writeLine($err.getStackTrace())
+    stderr.flushFile()
+  except Exception:
+    discard # If we can't write to stderr, there's nothing else we can do
+```
+
+### Configuration
+
+#### Setting Custom Error Handlers
+```nim
+# During initialization
+var logService = initLogService(errorHandler = myCustomErrorHandler)
+
+# Or at runtime on either the LogService...
+logService.setErrorHandler(myCustomErrorHandler)
+
+# ... or on a ThreadLocalLogService
+var localLogSvc = threadLocalRef(logService)
+localLogSvc.setErrorHandler(myCustomErrorHandler)
+```
+
+#### Disabling Error Reporting
+```nim
+proc silentErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  discard # Do nothing
+
+logService.setErrorHandler(silentErrorHandler)
+```
+
+### Error Handling Examples
+
+#### Example 1: Monitoring and Metrics
+```nim
+import std/atomics
+
+var errorCount: Atomic[int]
+var lastError: string
+
+proc monitoringErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  errorCount.atomicInc()
+  lastError = msg & ": " & err.msg
+
+  # Still log to stderr for immediate visibility
+  try:
+    stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
+    stderr.flushFile()
+  except: discard
+
+# Usage
+let logService = initLogService(errorHandler = monitoringErrorHandler)
+
+# Later, check error status
+if errorCount.load() > 0:
+  echo "Warning: ", errorCount.load(), " logging errors occurred"
+  echo "Last error: ", lastError
+```
+
+#### Example 2: Alternative Logging Destination
+```nim
+proc fileErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  try:
+    var f: File
+    if open(f, "logging_errors.log", fmAppend):
+      f.writeLine($now() & " [" & msg & "]: " & err.msg)
+      f.writeLine($err.getStackTrace())
+      f.writeLine("---")
+      f.close()
+  except:
+    # If file logging fails, fall back to stderr
+    try:
+      stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
+      stderr.flushFile()
+    except: discard
+
+let logService = initLogService(errorHandler = fileErrorHandler)
+```
+
+#### Example 3: Development vs Production
+```nim
+proc createErrorHandler(isDevelopment: bool): ErrorHandlerFunc =
+  if isDevelopment:
+    # Verbose error reporting for development
+    proc devErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+      stderr.writeLine("=== LOGGING ERROR ===")
+      stderr.writeLine("Context: " & msg)
+      stderr.writeLine("Error: " & err.msg)
+      stderr.writeLine("Stack Trace:")
+      stderr.writeLine($err.getStackTrace())
+      stderr.writeLine("====================")
+      stderr.flushFile()
+
+    return devErrorHandler
+  else:
+    # Minimal error reporting for production
+    proc prodErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+      try:
+        var f: File
+        if open(f, "/var/log/myapp/logging_errors.log", fmAppend):
+          f.writeLine($now() & " " & msg & ": " & err.msg)
+          f.close()
+      except: discard
+
+    return prodErrorHandler
+
+# Usage
+when defined(release):
+  let logService = initLogService(errorHandler = createErrorHandler(false))
+else:
+  let logService = initLogService(errorHandler = createErrorHandler(true))
+```
+
+### Best Practices
+
+#### Provide Fallbacks
+```nim
+proc robustErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  # Primary: Send to monitoring system
+  if not sendToMonitoring(err, msg):
+    # Secondary: Write to dedicated error log
+    if not writeToErrorLog(err, msg):
+      # Tertiary: Use stderr as last resort
+      try:
+        stderr.writeLine("LOGGING ERROR [" & msg & "]: " & err.msg)
+        stderr.flushFile()
+      except: discard
+```
+
+#### Keep Error Handlers Simple
+```nim
+# Good: Simple and focused
+proc simpleErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  errorCounter.atomicInc()
+  try:
+    stderr.writeLine("LOG ERROR: " & msg)
+    stderr.flushFile()
+  except: discard
+
+# Avoid: Complex operations that might themselves fail
+proc complexErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
+  # Don't do heavy operations like database writes,
+  # complex network operations, or file system operations
+  # that might fail and cause cascading errors
+```
 
 [log4j]: https://logging.apache.org/log4j/2.x/
 [logback]: https://logback.qos.ch/
 [effective logging level]: https://logback.qos.ch/manual/architecture.html#effectiveLevel
+[atomic-load]: https://nim-lang.org/docs/atomics.html#load%2CAtomic%5BT%5D%2CMemoryOrder
+[std-logging]: https://nim-lang.org/docs/logging.html
