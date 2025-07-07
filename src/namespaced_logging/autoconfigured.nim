@@ -10,7 +10,7 @@ export
   LogMessage,
   ConsoleLogAppender,
   CustomLogAppender,
-  CustomLogAppenderFunction,
+  CustomLogAppenderFunc,
   FileLogAppender,
 
   # Procs/Funcs
@@ -61,21 +61,21 @@ proc addLogAppender*(appender: LogAppender) =
 proc getLogger*(scope: string, lvl: Option[Level] = none[Level]()): Logger =
   getLogger(getThreadLocalLogServiceRef(), scope, lvl)
 
+template log*(lm: LogMessage) = log(getAutoconfiguredLogger(), lm)
 
-proc log*(lvl: Level, msg: string) = getDefaultLogger().log(lvl, msg)
-proc log*(lvl: Level, msg: JsonNode) = getDefaultLogger().log(lvl, msg)
+template log*(lvl: Level, msg: untyped) = log(getAutoconfiguredLogger(), lvl, msg)
 
-proc log*(lvl: Level, error: ref Exception, msg: string) =
-  getDefaultLogger().log(lvl, error, msg)
+template log*[T: ref Exception](lvl: Level, error: T, msg: untyped) =
+  log(getAutoconfiguredLogger(), lvl, error, msg)
 
 template debug*[T](msg: T) = log(lvlDebug, msg)
 template info*[T](msg: T) = log(lvlInfo, msg)
 template notice*[T](msg: T) = log(lvlNotice, msg)
 template warn*[T](msg: T) = log(lvlWarn, msg)
 template error*[T](msg: T) = log(lvlError, msg)
-template error*(error: ref Exception, msg: string) = log(lvlError, error, msg)
+template error*[T](error: ref Exception, msg: T) = log(lvlError, error, msg)
 template fatal*[T](msg: T) = log(lvlFatal, msg)
-template fatal*(error: ref Exception, msg: string) = log(lvlFatal, error, msg)
+template fatal*[T](error: ref Exception, msg: T) = log(lvlFatal, error, msg)
 
 when isMainModule:
   import std/unittest

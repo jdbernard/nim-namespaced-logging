@@ -2,8 +2,8 @@ import std/[algorithm, atomics, json, locks, options, os, paths, sequtils,
             strutils, tables, times]
 import timeutils
 
-from logging import Level
-export logging.Level
+from std/logging import Level
+export Level
 
 type
   GlobalLogServiceObj {.acyclic.} = object
@@ -41,7 +41,7 @@ type
   ThreadLocalLogService* = ref LogService
 
 
-  Logger* = object
+  Logger* = ref object
     scope*: string
     threadSvc: ThreadLocalLogService
 
@@ -122,6 +122,41 @@ type
   FileLogAppender* = ref object of LogAppender
     formatter*: LogMessageFormatter
     absPath*: Path
+
+let JNULL = newJNull()
+
+
+proc initLogMessage*(
+    scope: string,
+    lvl: Level,
+    message: string,
+    error: Option[ref Exception] = none[ref Exception](),
+    additionalData: JsonNode = JNULL): LogMessage =
+
+  LogMessage(
+    scope: scope,
+    level: lvl,
+    error: error,
+    timestamp: now(),
+    message: message,
+    additionalData: additionalData)
+
+
+proc initLogMessage*(
+    scope: string,
+    lvl: Level,
+    msg: JsonNode,
+    error: Option[ref Exception] = none[ref Exception]()): LogMessage =
+
+  LogMessage(
+    scope: scope,
+    level: lvl,
+    error: error,
+    timestamp: now(),
+    message:
+      if msg.hasKey("message"): msg["message"].getStr
+      else: "",
+    additionalData: msg)
 
 
 method clone*(app: LogAppender): LogAppender {.base, gcsafe.} =
@@ -399,85 +434,72 @@ func getEffectiveThreshold(logger: Logger): Level {.gcsafe.} =
     result = logger.threadSvc.thresholds[namespaces[0]]
 
 
-proc doLog(logger: Logger, msg: LogMessage) {.gcsafe.} =
-  ensureFreshness(logger.threadSvc)
+proc isEnabled*(l: Logger, lvl: Level): bool {.inline,gcsafe.} =
+  lvl >= l.getEffectiveThreshold
 
-  if msg.level < logger.getEffectiveThreshold: return
 
+proc sendToAppenders(logger: Logger, msg: LogMessage) {.gcsafe,inline.} =
   for app in logger.threadSvc.appenders:
     if logger.scope.startsWith(app.namespace) and msg.level >= app.threshold:
       app.appendLogMessage(logger.threadSvc, msg)
 
 
-proc log*(l: Logger, lvl: Level, msg: string) {.gcsafe.} =
-  l.doLog(LogMessage(
-    scope: l.scope,
-    level: lvl,
-    error: none[ref Exception](),
-    timestamp: now(),
-    message: msg,
-    additionalData: newJNull()))
+template log*(l: Logger, lm: LogMessage) =
+  ensureFreshness(l.threadSvc)
+
+  if lm.level >= l.getEffectiveThreshold:
+    sendToAppenders(l, lm)
+
+template log*(l: Logger, lvl: Level, msg: untyped) =
+  ensureFreshness(l.threadSvc)
+
+  if lvl >= l.getEffectiveThreshold:
+    sendToAppenders(l, initLogMessage(l.scope, lvl, msg))
 
 
-proc log*(
-    l: Logger,
+template log*[T: ref Exception](l: Logger, lvl: Level, err: T, msg: untyped) =
+  ensureFreshness(l.threadSvc)
+
+  if lvl >= l.getEffectiveThreshold:
+    sendToAppenders(
+      l,
+      initLogMessage(l.scope, lvl, msg, some(cast[ref Exception](err))))
+
+template log*(l: Option[Logger], lm: LogMessage) =
+  if l.isSome: log(l.get, lm)
+
+template log*(l: Option[Logger], lvl: Level, msg: untyped) =
+  if l.isSome: log(l.get, lvl, msg)
+
+template log*(
+    l: Option[Logger],
     lvl: Level,
     error: ref Exception,
-    msg: string ) {.gcsafe.} =
-  l.doLog(LogMessage(
-    scope: l.scope,
-    level: lvl,
-    error: some(error),
-    timestamp: now(),
-    message: msg,
-    additionalData: newJNull()))
-
-
-proc log*(l: Logger, lvl: Level, msg: JsonNode) {.gcsafe.} =
-  l.doLog(LogMessage(
-    scope: l.scope,
-    level: lvl,
-    error: none[ref Exception](),
-    timestamp: now(),
-    message:
-      if msg.hasKey("message"): msg["message"].getStr
-      else: "",
-    additionalData: msg))
-
-
-proc log*(l: Option[Logger], lvl: Level, msg: string) {.gcsafe.} =
-  if l.isSome: log(l.get, lvl, msg)
-
-proc log*(l: Option[Logger], lvl: Level, msg: JsonNode) {.gcsafe.} =
-  if l.isSome: log(l.get, lvl, msg)
-
-proc log*(l: Option[Logger], lvl: Level, error: ref Exception, msg: string) {.gcsafe.} =
+    msg: untyped) =
   if l.isSome: log(l.get, lvl, error, msg)
 
-template debug*[T](l: Logger, msg: T) = log(l, lvlDebug, msg)
-template info*[T](l: Logger, msg: T) = log(l, lvlInfo, msg)
-template notice*[T](l: Logger, msg: T) = log(l, lvlNotice, msg)
-template warn*[T](l: Logger, msg: T) = log(l, lvlWarn, msg)
+template debug*[L: Logger or Option[Logger], M](l: L, msg: M) =
+  log(l, lvlDebug, msg)
 
-template error*[T](l: Logger, msg: T) = log(l, lvlError, msg)
-template error*(l: Logger, error: ref Exception, msg: string) =
+template info*[L: Logger or Option[Logger], M](l: L, msg: M) =
+  log(l, lvlInfo, msg)
+
+template notice*[L: Logger or Option[Logger], M](l: L, msg: M) =
+  log(l, lvlNotice, msg)
+
+template warn*[L: Logger or Option[Logger], M](l: L, msg: M) =
+  log(l, lvlWarn, msg)
+
+template error*[L: Logger or Option[Logger], M](l: L, msg: M) =
+  log(l, lvlError, msg)
+
+template error*[L: Logger or Option[Logger], M](l: L, error: ref Exception, msg: M) =
   log(l, lvlError, error, msg)
 
-template fatal*[T](l: Logger, msg: T) = log(l, lvlFatal, msg)
-template fatal*(l: Logger, error: ref Exception, msg: string) =
-  log(l, lvlFatal, error, msg)
+template fatal*[L: Logger or Option[Logger], M](l: L, msg: M) =
+  log(l, lvlFatal, msg)
 
-template debug*[T](l: Option[Logger], msg: T) = log(l, lvlDebug, msg)
-template info*[T](l: Option[Logger], msg: T) = log(l, lvlInfo, msg)
-template notice*[T](l: Option[Logger], msg: T) = log(l, lvlNotice, msg)
-template warn*[T](l: Option[Logger], msg: T) = log(l, lvlWarn, msg)
-
-template error*[T](l: Option[Logger], msg: T) = log(l, lvlError, msg)
-template error*(l: Option[Logger], error: ref Exception, msg: string) =
-  log(l, lvlError, error, msg)
-
-template fatal*[T](l: Option[Logger], msg: T) = log(l, lvlFatal, msg)
-template fatal*(l: Option[Logger], error: ref Exception, msg: string) =
+template fatal*[L: Logger or Option[Logger], M](l: L, error: ref Exception, msg: M) =
   log(l, lvlFatal, error, msg)
 
 # -----------------------------------------------------------------------------
@@ -1015,6 +1037,25 @@ when isMainModule:
         lm[0].scope == "api/users/detail"
         lm[0].level == lvlDebug
 
+    test "message construction is avoided if the message is not logged":
+
+      var expensiveCallCount = 0
+      proc expensiveCall(): int =
+        inc expensiveCallCount
+        return expensiveCallCount
+
+      ls.setThreshold("test", lvlInfo)
+      let logger = ls.getLogger("test")
+
+      logger.debug("Expensive call (" & $expensiveCall() & ")")
+      logger.info("Expensive call (" & $expensiveCall() & ")")
+
+      let lm = loggedMsgs.get()
+      check:
+        lm.len == 1
+        lm[0].message.contains("Expensive call (1)")
+        expensiveCallCount == 1
+
   suite "Appender Functionality":
     setup:
       let ls = threadLocalRef(initLogService())
@@ -1112,6 +1153,8 @@ when isMainModule:
       check:
         lines.len == 1
         "test message" in lines[0]
+
+      removeFile(pathStr)
 
     test "file appender clone":
       let original = initFileLogAppender("tempfile.log", namespace = "test")
