@@ -21,6 +21,12 @@ type
     errorHandler: ErrorHandlerFunc
     errorHandlerLock: Lock
 
+    takeOverGls: Option[GlobalLogService]
+      # Used to direct ThreadLocalLogServices that they should switch to a new
+      # GlobalLogService (logging root). This is used primarily in the context of
+      # autoconfigured logging where we want to be able to reconfigure the GLS
+      # used for autologging, have existing ThreadLocalLogServices switch over
+      # to the newly provided GLS, and let the old GLS get garbage-collected
 
   GlobalLogService = ref GlobalLogServiceObj
 
@@ -123,6 +129,7 @@ type
     formatter*: LogMessageFormatter
     absPath*: Path
 
+const UninitializedConfigVersion = low(int)
 let JNULL = newJNull()
 
 
@@ -232,6 +239,12 @@ proc ensureFreshness*(ls: var LogService) =
 
   if ls.configVersion == ls.global.configVersion.load(): return
 
+  if ls.global.takeOverGls.isSome:
+    let newGls = ls.global.takeOverGls.get
+    assert not newGls.isNil
+    assert newGls.initialized.load
+    ls.global = newGls
+
   withLock ls.global.lock:
     ls.configVersion = ls.global.configVersion.load
 
@@ -243,6 +256,28 @@ proc ensureFreshness*(ls: var LogService) =
 
 
 proc ensureFreshness*(ls: ThreadLocalLogService) = ensureFreshness(ls[])
+
+
+proc initGlobalLogService(
+    rootLevel = lvlAll,
+    errorHandler = defaultErrorHandlerFunc): GlobalLogService =
+  result = GlobalLogService()
+  result.configVersion.store(0)
+  initLock(result.lock)
+  initLock(result.errorHandlerLock)
+
+  result.appenders = @[]
+  result.thresholds = newTable[string, Level]()
+  result.rootLevel.store(rootLevel)
+  result.errorHandler = errorHandler
+
+  result.initialized.store(true)
+
+proc initLogService(gls: GlobalLogService): LogService =
+  var lsRef: ThreadLocalLogService = ThreadLocalLogService(
+    configVersion: UninitializedConfigVersion, global: gls)
+  ensureFreshness(lsRef)
+  result = lsRef[]
 
 
 proc initLogService*(
@@ -262,24 +297,12 @@ proc initLogService*(
   ## configure thresholds, and create loggers. The ref returned by this
   ## procedure should also be retained by the main thread so that garbage
   ## collection does not harvest the global state while it is still in use.
-  let global = GlobalLogService()
-  global.configVersion.store(0)
-  global.initialized.store(true)
-  initLock(global.lock)
-  initLock(global.errorHandlerLock)
-
-  global.appenders = @[]
-  global.thresholds = newTable[string, Level]()
-  global.rootLevel.store(rootLevel)
-  global.errorHandler = errorHandler
-
-  var lsRef: ThreadLocalLogService = ThreadLocalLogService(configVersion: -1, global: global)
-  ensureFreshness(lsRef)
-  result = lsRef[]
+  let global = initGlobalLogService(rootLevel, errorHandler)
+  result = initLogService(global)
 
 
 proc threadLocalRef*(ls: LogService): ThreadLocalLogService =
-  result = new(LogService)
+  new result
   result[] = ls
 
 
@@ -796,6 +819,114 @@ method appendLogMessage(
       "unable to append to FileLogAppender")
 
 
+# -----------------------------------------------------------------------------
+# Autoconfiguration Implementation
+# -----------------------------------------------------------------------------
+
+var autoGls = GlobalLogService()
+  # we create the global reference so that it is maintained by the thread that
+  # first imported this module, but leave it uninitialized until
+  # initAutoconfiguredLogService is actually called (when
+  # namespaced_logging/autoconfigured is imported)
+
+var autoTlls {.threadvar.}: ThreadLocalLogService
+var autoLogger {.threadvar.}: Logger
+
+
+proc initAutoconfiguredLogService*() =
+  ## This exists primarily for namespaced_logging/autoconfigured to call as
+  ## part of its setup process. This function needs to live here and be
+  ## exported for the autoconfigured module's visibility as many of the internal
+  ## fields required to properly manage the autoconfigured LogService are not
+  ## exported, to avoid confusion and prevent misuse of the library (from a
+  ## thread-safety POV).
+
+  assert not autoGls.isNil
+
+  let oldGls = autoGls
+  autoGls = initGlobalLogService()
+
+  if oldGls.initialized.load:
+    # If we already have an auto-configured GLS, let's log to the existing GLS
+    # that we're replacing it.
+
+    withLock oldGls.lock:
+      if autoTlls.isNil:
+        # If we somehow have an auto-configured GLS but never instantiated a
+        # thread-local LogService, let's do so temporarily.
+        autoTlls = new(LogService)
+        autoTlls.global = oldGls
+        ensureFreshness(autoTlls)
+
+      warn(
+        getLogger(autoTlls, "namespaced_logging/autoconfigured"),
+        "initializing a new auto-configured logging service, replacing this one")
+
+      oldGls.takeOverGls = some(autoGls)
+      oldGls.configVersion.atomicInc
+
+  autoTlls = threadLocalRef(initLogService(autoGls))
+  autoLogger = autoTlls.getLogger("")
+
+
+proc getAutoconfiguredLogService*(): ThreadLocalLogService =
+  if autoTlls.isNil:
+    if not autoGls.initialized.load():
+      initAutoconfiguredLogService()
+      assert autoGls.initialized.load()
+
+    autoTlls = threadLocalRef(initLogService(autoGls))
+
+  return autoTlls
+
+
+proc getAutoconfiguredLogger*(): Logger =
+  if autoLogger.isNil:
+    autoLogger = getLogger(getAutoconfiguredLogService(), "")
+
+  return autoLogger
+
+
+proc useForAutoconfiguredLogging*(ls: LogService) =
+  # Reconfigure the autoconfigured logging behavior to use the given LogService
+  # configuration instead of the existing autoconfigured configuration. This is
+  # useful in applications that want to control the behavior of third-party
+  # libraries or code that use namespaced_logging/autoconfigured.
+  #
+  # Libraries and other non-application code are suggested to use
+  # namespaced_logging/autoconfigured. The autoconfigured log service has no
+  # appenders when it is initialized which means that applications which are
+  # unaware of namespaced_logging are unaffected and no logs are generated.
+
+  if ls.global == autoGls:
+    # As of Nim 2 `==` on `ref`s performs a referential equality check by
+    # default, and we don't overload `==`. Referential equality is what we're
+    # after here. If the reference in ls already points to the same place as
+    # autoGls, we have nothing to do
+    return
+
+  if autoGls.initialized.load:
+    # if there is an existing autoGls, let's leave instructions for loggers and
+    # LogService instances to move to the newly provided GLS before we change
+    # our autoGls reference.
+    withLock autoGls.lock:
+      autoGls.takeOverGls = some(ls.global)
+      autoGls.configVersion.atomicInc
+
+  autoGls = ls.global
+
+
+proc useForAutoconfiguredLogging*(tlls: ThreadLocalLogService) =
+  useForAutoconfiguredLogging(tlls[])
+
+
+proc resetAutoconfiguredLogging*() =
+  ## Reset the auto-configured logging service. In general it is suggested to
+  # define a new LogService, configure it, and pass it to
+  # *useForAutoconfiguredLogging* instead.  in a way that disconnects it
+  #from
+  autoGls = GlobalLogService()
+  initAutoconfiguredLogService()
 
 when isMainModule:
 

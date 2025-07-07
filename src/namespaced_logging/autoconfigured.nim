@@ -1,4 +1,4 @@
-import std/[json, options]
+import std/[json, options, strutils]
 from logging import Level
 import ../namespaced_logging
 
@@ -18,48 +18,29 @@ export
   initConsoleLogAppender,
   initCustomLogAppender,
   initFileLogAppender,
-  formatJsonStructuredLog
-
-var globalLogServiceRef: ThreadLocalLogService = new(LogService)
-globalLogServiceRef[] = initLogService()
-
-var threadLocalLogServiceRef {.threadvar.}: ThreadLocalLogService
-var defaultLogger {.threadvar.}: Option[Logger]
-
-
-proc getThreadLocalLogServiceRef(): ThreadLocalLogService {.inline.} =
-  if threadLocalLogServiceRef.isNil:
-    threadLocalLogServiceRef = new(LogService)
-    threadLocalLogServiceRef[] = globalLogServiceRef[]
-
-  return threadLocalLogServiceRef
-
-proc getDefaultLogger(): Logger {.inline.} =
-
-  if defaultLogger.isNone:
-    defaultLogger = some(getThreadLocalLogServiceRef().getLogger(""))
-
-  return defaultLogger.get
-
-
-proc useForAutoconfiguredLogging*(ls: LogService) =
-  globalLogServiceRef[] = ls
+  formatJsonStructuredLog,
+  useForAutoconfiguredLogging
 
 
 proc setRootLoggingThreshold*(lvl: Level) =
-  setRootThreshold(getThreadLocalLogServiceRef(), lvl)
+  setRootThreshold(getAutoconfiguredLogService(), lvl)
 
 
 proc setLoggingThreshold*(scope: string, lvl: Level) =
-  setThreshold(getThreadLocalLogServiceRef(), scope, lvl)
+  setThreshold(getAutoconfiguredLogService(), scope, lvl)
 
 
 proc addLogAppender*(appender: LogAppender) =
-  addAppender(getThreadLocalLogServiceRef(), appender)
+  addAppender(getAutoconfiguredLogService(), appender)
+
+
+proc clearLogAppenders*() =
+  clearAppenders(getAutoconfiguredLogService())
 
 
 proc getLogger*(scope: string, lvl: Option[Level] = none[Level]()): Logger =
-  getLogger(getThreadLocalLogServiceRef(), scope, lvl)
+  getLogger(getAutoconfiguredLogService(), scope, lvl)
+
 
 template log*(lm: LogMessage) = log(getAutoconfiguredLogger(), lm)
 
