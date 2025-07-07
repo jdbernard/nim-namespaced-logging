@@ -1,6 +1,7 @@
 import std/[algorithm, atomics, json, locks, options, os, paths, sequtils,
             strutils, tables, times]
 import timeutils
+import std/logging as stdlog
 
 from std/logging import Level
 export Level
@@ -128,6 +129,19 @@ type
   FileLogAppender* = ref object of LogAppender
     formatter*: LogMessageFormatter
     absPath*: Path
+
+  StdLoggingAppender* = ref object of LogAppender
+    ## Log appender that forwards log messages to the std/logging
+    ## implementation. This is primarily intended for libraries and other
+    ## situations where you expect that your code will be third-party to others
+    ## and want to respect applications which use std/logging for log handlers
+    ## and configuration.
+
+    fallbackOnly*: bool
+      ## when true, only forward to std/logging where there are no appenders
+      ## configured on the related LogService
+
+    formatter*: LogMessageFormatter
 
 const UninitializedConfigVersion = low(int)
 let JNULL = newJNull()
@@ -436,6 +450,19 @@ proc addAppender*(ls: ThreadLocalLogService, appender: LogAppender) {.gcsafe.} =
   addAppender(ls[], appender)
 
 
+proc clearAppenders*(ls: var LogService) {.gcsafe.} =
+  ## Remove all log appenders added to the global log service and refresh the
+  ## local thread state. The updated global state will trigger other threads to
+  ## refresh their state as well.
+  withLock ls.global.lock:
+    ls.global.appenders = @[]
+    ls.global.configVersion.atomicInc
+
+
+proc clearAppenders*(ls: ThreadLocalLogService) {.gcsafe.} =
+  clearAppenders(ls[])
+
+
 func getEffectiveThreshold(logger: Logger): Level {.gcsafe.} =
   ## Get the effective logging level threshold for a logger. This is the most
   ## specific level that is set for the logger or any of its parents. The root
@@ -525,8 +552,9 @@ template fatal*[L: Logger or Option[Logger], M](l: L, msg: M) =
 template fatal*[L: Logger or Option[Logger], M](l: L, error: ref Exception, msg: M) =
   log(l, lvlFatal, error, msg)
 
+
 # -----------------------------------------------------------------------------
-# CustomerLogAppender Implementation
+# CustomLogAppender Implementation
 # -----------------------------------------------------------------------------
 
 func initCustomLogAppender*[T](
@@ -536,7 +564,7 @@ func initCustomLogAppender*[T](
     threshold = lvlAll): CustomLogAppender[T] {.gcsafe.} =
 
   if doLogMessage.isNil:
-    debugEcho "initCustomLogAppender: doLogMessage is nil"
+    raise newException(ValueError, "initCustomLogAppender: doLogMessage is nil")
 
   result = CustomLogAppender[T](
     namespace: namespace,
@@ -545,8 +573,8 @@ func initCustomLogAppender*[T](
     state: state)
 
 method clone*[T](cla: CustomLogAppender[T]): LogAppender {.gcsafe.} =
-  if cla.doLogMessage.isNil:
-    debugEcho "CustomLogAppender#clone: source doLogMessage is nil"
+  assert not cla.doLogMessage.isNil,
+    "CustomLogAppender#clone: source doLogMessage is nil"
 
   result = CustomLogAppender[T](
     namespace: cla.namespace,
@@ -561,7 +589,7 @@ method appendLogMessage[T](
     msg: LogMessage) {.gcsafe.} =
   try:
     if cla.doLogMessage.isNil:
-      debugEcho "doLogMessage is nil"
+      raise newException(ValueError, "CustomLogAppender.appendLogMessage: doLogMessage is nil")
     else: cla.doLogMessage(cla.state, msg)
   except Exception:
     ls.global.reportLoggingError(
@@ -817,6 +845,48 @@ method appendLogMessage(
     ls.global.reportLoggingError(
       getCurrentException(),
       "unable to append to FileLogAppender")
+
+
+# -----------------------------------------------------------------------------
+# StdLoggingAppender Implementation
+# -----------------------------------------------------------------------------
+
+func formatForwardedLog*(lm: LogMessage): string =
+  ## Default formatter for the StdLoggingAppender that prepends the logger
+  ## scope to the message before formatting the message via
+  ## *formatSimpleTextLog*
+  "[" & lm.scope & "] " & formatSimpleTextLog(lm)
+
+
+func initStdLoggingAppender*(
+    fallbackOnly = true,
+    formatter = formatForwardedLog,
+    namespace = "",
+    threshold = lvlAll): StdLoggingAppender =
+
+  result = StdLoggingAppender(
+    namespace: namespace,
+    threshold: threshold,
+    fallbackOnly: fallbackOnly,
+    formatter: formatter)
+
+
+method clone*(sla: StdLoggingAppender): LogAppender {.gcsafe.} =
+  result = StdLoggingAppender(
+    namespace: sla.namespace,
+    threshold: sla.threshold,
+    fallbackOnly: sla.fallbackOnly,
+    formatter: sla.formatter)
+
+
+method appendLogMessage*(
+    sla: StdLoggingAppender,
+    ls: ThreadLocalLogService,
+    msg: LogMessage) {.gcsafe.} =
+
+  if sla.fallbackOnly and ls.appenders.len > 1: return
+
+  stdlog.log(msg.level, sla.formatter(msg))
 
 
 # -----------------------------------------------------------------------------
