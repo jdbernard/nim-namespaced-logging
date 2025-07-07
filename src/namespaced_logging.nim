@@ -998,13 +998,14 @@ proc resetAutoconfiguredLogging*() =
   autoGls = GlobalLogService()
   initAutoconfiguredLogService()
 
+# -----------------------------------------------------------------------------
+# Tests
+# -----------------------------------------------------------------------------
+
 when isMainModule:
 
-  import std/[tempfiles, unittest]
+  import std/[files, tempfiles, unittest]
   import ./namespaced_logging/testutil
-  # -----------------------------------------------------------------------------
-  # Tests
-  # -----------------------------------------------------------------------------
 
   suite "GlobalLogService Initialization":
 
@@ -1128,8 +1129,7 @@ when isMainModule:
     setup:
       let ls = threadLocalRef(initLogService())
       let loggedMsgs = initLoggedMessages()
-      let testAppender = initTestLogAppender(loggedMsgs)
-      ls.addAppender(testAppender)
+      ls.addAppender(initTestLogAppender(loggedMsgs))
 
     test "getLogger creates logger with correct scope":
       let logger = ls.getLogger("api/users")
@@ -1138,6 +1138,26 @@ when isMainModule:
     test "getLogger with threshold sets namespace level":
       let logger = ls.getLogger("api/users", some(lvlWarn))
       check ls.thresholds["api/users"] == lvlWarn
+
+    test "log methods work":
+      let logger = ls.getLogger("test")
+
+      logger.log(lvlDebug, "debug string msg")
+      logger.log(lvlInfo, %*{"message": "info json msg"})
+      logger.log(lvlNotice, "notice string msg")
+      logger.log(lvlError, newException(ValueError, "exception msg"), "error ex. msg")
+
+      let lm = loggedMsgs.get()
+      check:
+        lm.len == 4
+        lm[0].level == lvlDebug
+        lm[0].message.contains("debug string msg")
+        lm[1].level == lvlInfo
+        lm[1].message.contains("info json msg")
+        lm[2].level == lvlNotice
+        lm[2].message.contains("notice string msg")
+        lm[3].level == lvlError
+        lm[3].message.contains("error ex. msg")
 
     test "logger convenience methods work":
       let logger = ls.getLogger("test")
@@ -1187,8 +1207,7 @@ when isMainModule:
     setup:
       let ls = threadLocalRef(initLogService())
       let loggedMsgs = initLoggedMessages()
-      let testAppender = initTestLogAppender(loggedMsgs)
-      ls.addAppender(testAppender)
+      ls.addAppender(initTestLogAppender(loggedMsgs))
 
     test "root level filtering":
       ls.setRootThreshold(lvlInfo)
@@ -1365,3 +1384,107 @@ when isMainModule:
       let clonedFile = FileLogAppender(cloned)
       check clonedFile.absPath == original.absPath
       check clonedFile.namespace == "test"
+
+  suite "StdLoggingAppender":
+
+    var fileLogger: FileLogger
+    var tempFile: File
+    var tempFilename: string
+
+    setup:
+      let ls = threadLocalRef(initLogService())
+      (tempFile, tempFilename) = createTempFile("stdlog_test", ".tmp.log")
+      fileLogger = newFileLogger(tempFile, flushThreshold = lvlAll)
+      addHandler(fileLogger)
+
+    teardown:
+      removeHandler(fileLogger)
+      try: close(tempFile)
+      except Exception: discard
+      removeFile(tempFilename)
+
+    test "forwards to std logging":
+      ls.addAppender(initStdLoggingAppender())
+      let logger = ls.getLogger("test")
+
+      logger.debug("message at debug")
+      logger.info("message at info")
+      logger.error("message at error")
+
+      tempFile.flushFile()
+      close(tempFile)
+
+      check open(tempFile, tempFilename, fmRead)
+      let lines = toSeq(lines(tempFile))
+      check:
+        lines.len == 3
+        lines[0] == "DEBUG [test] message at debug"
+        lines[1] == "INFO [test] message at info"
+        lines[2] == "ERROR [test] message at error"
+
+    test "fallbackOnly works when on":
+      ls.addAppender(initStdLoggingAppender())
+      let logger = ls.getLogger("test")
+
+      logger.debug("message at debug")
+      logger.info("message at info")
+      logger.error("message at error")
+
+      let loggedMsgs = initLoggedMessages()
+      ls.addAppender(initTestLogAppender(loggedMsgs))
+
+      logger.notice("message at notice")
+      logger.warn("message at warn")
+      logger.fatal("message at fatal")
+
+      tempFile.flushFile()
+      close(tempFile)
+
+      check open(tempFile, tempFilename, fmRead)
+      let lines = toSeq(lines(tempFile))
+      let lm = loggedMsgs.get()
+      check:
+        lines.len == 3
+        lines[0] == "DEBUG [test] message at debug"
+        lines[1] == "INFO [test] message at info"
+        lines[2] == "ERROR [test] message at error"
+
+        lm.len == 3
+        lm[0].message.contains("message at notice")
+        lm[1].message.contains("message at warn")
+        lm[2].message.contains("message at fatal")
+
+    test "fallbackOnly works when off":
+      ls.addAppender(initStdLoggingAppender(fallbackOnly = false))
+      let logger = ls.getLogger("test")
+
+      logger.debug("message at debug")
+      logger.info("message at info")
+      logger.error("message at error")
+
+      let loggedMsgs = initLoggedMessages()
+      ls.addAppender(initTestLogAppender(loggedMsgs))
+
+      logger.notice("message at notice")
+      logger.warn("message at warn")
+      logger.fatal("message at fatal")
+
+      tempFile.flushFile()
+      close(tempFile)
+
+      check open(tempFile, tempFilename, fmRead)
+      let lines = toSeq(lines(tempFile))
+      let lm = loggedMsgs.get()
+      check:
+        lines.len == 6
+        lines[0] == "DEBUG [test] message at debug"
+        lines[1] == "INFO [test] message at info"
+        lines[2] == "ERROR [test] message at error"
+        lines[3] == "NOTICE [test] message at notice"
+        lines[4] == "WARN [test] message at warn"
+        lines[5] == "FATAL [test] message at fatal"
+
+        lm.len == 3
+        lm[0].message.contains("message at notice")
+        lm[1].message.contains("message at warn")
+        lm[2].message.contains("message at fatal")
