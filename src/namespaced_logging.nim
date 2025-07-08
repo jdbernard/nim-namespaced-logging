@@ -862,7 +862,7 @@ func initStdLoggingAppender*(
     fallbackOnly = true,
     formatter = formatForwardedLog,
     namespace = "",
-    threshold = lvlAll): StdLoggingAppender =
+    threshold = lvlAll): StdLoggingAppender {.gcsafe.} =
 
   result = StdLoggingAppender(
     namespace: namespace,

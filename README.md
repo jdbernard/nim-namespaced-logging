@@ -136,6 +136,43 @@ proc configureLogging(localLogSvc: ThreadLocalLogService, verbose: bool) =
 # Changes automatically propagate to all threads
 ```
 
+### Autoconfigured Logging in Library Code, Falling Back to `std/logging`
+
+One of the primary uses-cases for the autoconfigured option is for use in
+libraries or other packaged code where the main application may not be using
+or even aware of namespaced\_logging, especially when paired with the
+[*StdLoggingAppender*][#StandingLoggingAppender], which can be configured to
+fallback to std/logging when no appenders have been configured for
+namespaced\_logging.
+
+```nim
+import namespaced_logging/autoconfigured
+
+# Add a StdLoggingAppender to forward logs to std/logging
+addLogAppender(initStdLoggingAppender(fallbackOnly = true))
+
+# will be forwarded to std/logging.debug
+debug("log from library code")
+
+addLogAppender(initConsoleLogAppender())
+
+# will no longer be forwarded to std/logging.debug
+debug("log from library code")
+```
+
+### Providing A Custom Configuration to Replace Autoconfigured Service
+
+```nim
+import namespace_logging
+
+var ls = initLogService()
+ls.addAppender(initConsoleLogAppender())
+
+useForAutoconfiguredLogging(ls)
+
+# from this point on any autoconfigured LogService or Loggers will use the
+# configuration defined by ls
+```
 ## Loggers and Appenders
 
 The logging system is composed of two main components: loggers and appenders.
@@ -224,6 +261,26 @@ not hold open file handles. The *FileLogAppender* attempts to batch messages
 by destination file, opens the file with mode `fmAppend`, writes the current
 batch of log messages, and then closes the file handle. Because of this, it has
 no problem if another process moves or truncates any of the target log files.
+
+### StdLoggingAppender
+
+Provides a fallback to [std/logging][std-logging]-based logging. This is
+primarily intended for use in libraries or other contexts where you want to
+fall back to std/logging if the application is not using or hasn't configured
+namespaced\_logging.
+
+By default the *StdLoggingAppender* only logs when no namespaced\_logging
+appenders are configured but it can also be configured to always forward log
+messages regardless of whether namespaced\_logging has other appenders by
+setting `fallbackOnly = false`.
+
+```nim
+func initStdLoggingAppender*(
+    fallbackOnly = true,
+    formatter = formatForwardedLog,
+    namespace = "",
+    threshold = lvlAll): StdLoggingAppender {.gcsafe.}
+```
 
 ### CustomLogAppender
 
@@ -488,6 +545,7 @@ logService.setErrorHandler(silentErrorHandler)
 ### Best Practices
 
 #### Provide Fallbacks
+
 ```nim
 proc robustErrorHandler(err: ref Exception, msg: string) {.gcsafe, nimcall.} =
   # Primary: Send to monitoring system
