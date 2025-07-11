@@ -8,7 +8,7 @@ four main motivating features:
 - Safe and straightforward to use in multi-threaded applications.
 - Native support for structured logging.
 - Simple, autoconfigured usage pattern reminiscent of the
-  [std/logging][std-logging] interface.
+  [std/logging][std-logging] interface (*not yet implemented*)
 
 ## Getting Started
 
@@ -20,38 +20,6 @@ nimble install https://github.com/jdbernard/nim-namespaced-logging
 ```
 
 ## Usage Patterns
-
-### Simple, Autoconfigured Setup
-```nim
-import namespaced_logging/autoconfigured
-
-# Zero configuration of the LogService required, appender/logger configuration
-# is immediately available
-addLogAppender(initConsoleLogAppender())
-info("Application started")
-
-# Set global threshold
-setRootLoggingThreshold(lvlWarn)
-
-# Namespaced loggers, thresholds, and appenders supported
-addLogAppender(initFileLogAppender(
-  filePath = "/var/log/app_db.log",
-  formatter = formatJsonStructuredLog, # provided in namespaced_logging
-  namespace = "app/db",
-  threshold = lvlInfo))
-
-# in DB code
-let dbLogger = getLogger("app/db/queryplanner")
-dbLogger.debug("Beginning query plan...")
-
-# native support for structured logs (import std/json)
-dbLogger.debug(%*{
-  "method": "parseParams",
-  "message": "unrecognized param type",
-  "invalidType": $params[idx].type,
-  "metadata": %(params.meta)
-} )
-```
 
 ### Manual Configuration
 ```nim
@@ -71,34 +39,6 @@ let localLogSvc = threadLocalRef(ls)
 let apiLogger = localLogSvc.getLogger("api")
 let dbLogger = localLogSvc.getLogger("db")
 ```
-
-### Autoconfigured Multithreaded Application
-```nim
-import namespaced_logging/autoconfigured
-import mummy, mummy/routers
-
-# Main thread setup
-addLogAppender(initConsoleLogAppender())
-
-proc createApiRouter*(apiCtx: ProbatemApiContext): Router =
-  # This will run on a separate thread, but the thread creation is managed by
-  # mummy, not us. Log functions still operate correctly and respect the
-  # configuration setup on the main thread
-  let logger = getLogger("api")
-  logger.trace(%*{ "method_entered": "createApiRouter" })
-
-  # API route setup...
-
-  logger.debug(%*{ "method": "createApiRouter", "routes": numRoutes })
-
-
-let server = newServer(createApiRouter(), workerThreads = 4)
-ctx.server.serve(Port(8080))
-info("Serving MyApp v1.0.0 on port 8080")
-
-setThreshold("api", lvlTrace) # will be picked up by loggers on worker threads
-```
-
 
 ### Manual Multithreaded Application
 ```nim
@@ -136,43 +76,6 @@ proc configureLogging(localLogSvc: ThreadLocalLogService, verbose: bool) =
 # Changes automatically propagate to all threads
 ```
 
-### Autoconfigured Logging in Library Code, Falling Back to `std/logging`
-
-One of the primary uses-cases for the autoconfigured option is for use in
-libraries or other packaged code where the main application may not be using
-or even aware of namespaced\_logging, especially when paired with the
-[*StdLoggingAppender*][#StandingLoggingAppender], which can be configured to
-fallback to std/logging when no appenders have been configured for
-namespaced\_logging.
-
-```nim
-import namespaced_logging/autoconfigured
-
-# Add a StdLoggingAppender to forward logs to std/logging
-addLogAppender(initStdLoggingAppender(fallbackOnly = true))
-
-# will be forwarded to std/logging.debug
-debug("log from library code")
-
-addLogAppender(initConsoleLogAppender())
-
-# will no longer be forwarded to std/logging.debug
-debug("log from library code")
-```
-
-### Providing A Custom Configuration to Replace Autoconfigured Service
-
-```nim
-import namespace_logging
-
-var ls = initLogService()
-ls.addAppender(initConsoleLogAppender())
-
-useForAutoconfiguredLogging(ls)
-
-# from this point on any autoconfigured LogService or Loggers will use the
-# configuration defined by ls
-```
 ## Loggers and Appenders
 
 The logging system is composed of two main components: loggers and appenders.
@@ -320,26 +223,17 @@ behave more intuitively in a multi-threaded environment than
 true in environments where the logging setup code may be separated from the
 thread-management code (in an HTTP server, for example).
 
-As described in the [Getting Started](#getting-started) section, you can use
-the `namespaced_logging/autoconfigured` import to use a simplified interface
-that more closely matches the contract of [std/logging][std-logging]. In this
-case all thread and state management is done for you. The only limitation is
-that you cannot create multiple global *LogService* instances. In practice this
-is an uncommon need.
+The *LogService* object is the main entry point for the logging system and
+should be initialized on the main thread. The *LogService* contains a reference
+to the "source of truth" for logging configuration and is safe to be shared
+between all threads.
 
-If you do need or want the flexibility to manage the state yourself, import
-`namespaced_logging` directly. In this case, the thread which initialized
-*LogService* must also be the longest-living thread that uses that *LogService*
-instance. If the initializing thread terminates or the *LogService* object in
-that thread goes out of scope while other threads are still running and using
-the *LogService*, the global state may be harvested by the garbage collector,
-leading to use-after-free errors when other threads attempt to log (likely
-causing segfaults).
-
-When managing the state yourself, the *LogService* object is the main entry
-point for the logging system and should be initialized on the main thread. The
-*LogService* contains a reference to the "source of truth" for logging
-configuration and is safe to be shared between all threads.
+The thread which initializes a *LogService* must also be the longest-living
+thread that uses that *LogService* instance. If the initializing thread
+terminates or the *LogService* object in that thread goes out of scope while
+other threads are still running and using the *LogService*, the global state
+may be harvested by the garbage collector, leading to use-after-free errors
+when other threads attempt to log (likely causing segfaults).
 
 Individual threads should use the *threadLocalRef* proc to obtain a
 *ThreadLocalLogService* reference that can be used to create *Logger* objects.

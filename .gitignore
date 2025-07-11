@@ -3,3 +3,4 @@ nimcache/
 tests/tests
 src/namespaced_logging.out
 src/namespaced_logging/autoconfigured
+.worktrees

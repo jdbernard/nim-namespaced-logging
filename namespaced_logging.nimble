@@ -1,6 +1,6 @@
 # Package
 
-version       = "2.0.1"
+version       = "2.0.2"
 author        = "Jonathan Bernard"
 description   = "Wrapper around std/logging to provide namespaced logging."
 license       = "MIT"
@@ -15,6 +15,5 @@ requires @["nim >= 2.2.0", "zero_functional"]
 requires "timeutils"
 
 task test, "Run unittests for the package.":
-  exec "nimble c src/namespaced_logging.nim src/namespaced_logging/autoconfigured.nim"
+  exec "nimble c src/namespaced_logging.nim"
   exec "src/namespaced_logging.out"
-  exec "src/namespaced_logging/autoconfigured"

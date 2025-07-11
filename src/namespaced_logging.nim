@@ -1,5 +1,5 @@
-import std/[algorithm, atomics, json, locks, options, os, paths, sequtils,
-            strutils, tables, times]
+import std/[algorithm, atomics, exitprocs, json, locks, options, os, paths,
+            sequtils, strutils, tables, times]
 import timeutils
 import std/logging as stdlog
 
@@ -16,18 +16,8 @@ type
     thresholds: TableRef[string, Level]
     rootLevel: Atomic[Level]
 
-    console: ThreadedConsoleLoggingState
-    file: ThreadedFileLoggingState
-
     errorHandler: ErrorHandlerFunc
     errorHandlerLock: Lock
-
-    takeOverGls: Option[GlobalLogService]
-      # Used to direct ThreadLocalLogServices that they should switch to a new
-      # GlobalLogService (logging root). This is used primarily in the context of
-      # autoconfigured logging where we want to be able to reconfigure the GLS
-      # used for autologging, have existing ThreadLocalLogServices switch over
-      # to the newly provided GLS, and let the old GLS get garbage-collected
 
   GlobalLogService = ref GlobalLogServiceObj
 
@@ -94,18 +84,11 @@ type
     absPath: Path
 
 
-  ThreadedConsoleLoggingState = object
+  LogWriterThreadState[M] = object
     initialized: Atomic[bool]
     shutdown: Atomic[bool]
-    chan: Channel[ConsoleMessage]
-    writerThread: Thread[GlobalLogService]
-
-
-  ThreadedFileLoggingState = object
-    initialized: Atomic[bool]
-    shutdown: Atomic[bool]
-    chan: Channel[FileMessage]
-    writerThread: Thread[GlobalLogService]
+    chan: Channel[M]
+    writerThread: Thread[void]
 
 
   ConsoleLogAppender* = ref object of LogAppender
@@ -145,6 +128,12 @@ type
 
 const UninitializedConfigVersion = low(int)
 let JNULL = newJNull()
+
+var consoleLogging {.global.}: LogWriterThreadState[ConsoleMessage]
+var fileLogging {.global.}: LogWriterThreadState[FileMessage]
+var loggingThreadInitLock {.global.}: Lock
+
+initLock(loggingThreadInitLock)
 
 
 proc initLogMessage*(
@@ -200,39 +189,38 @@ proc defaultErrorHandlerFunc*(
     stderr.flushFile()
   except Exception: discard # we tried...
 
-proc shutdownThreadedConsoleLogging(gls: var GlobalLogServiceObj) =
-  if not gls.console.initialized.load(): return
+proc shutdownThreadedConsoleLogging() =
+  if not consoleLogging.initialized.load(): return
 
-  gls.console.shutdown.store(true) # signal shutdown
+  withLock loggingThreadInitLock:
+    consoleLogging.shutdown.store(true) # signal shutdown
 
-  # Send sentinel values to wake up the writer thread
-  try: gls.console.chan.send(ConsoleMessage(message: "", useStderr: false))
-  except Exception: discard
+    # Send sentinel values to wake up the writer thread
+    try: consoleLogging.chan.send(ConsoleMessage(message: "", useStderr: false))
+    except Exception: discard
 
-  joinThread(gls.console.writerThread)
-  gls.console.chan.close()
-  gls.console.initialized.store(false)
+    joinThread(consoleLogging.writerThread)
+    consoleLogging.chan.close()
+    consoleLogging.initialized.store(false)
 
 
-proc shutdownThreadedFileLogging(gls: var GlobalLogServiceObj) =
-  if not gls.file.initialized.load(): return
+proc shutdownThreadedFileLogging() =
+  if not fileLogging.initialized.load(): return
 
-  gls.file.shutdown.store(true) # signal shutdown
+  fileLogging.shutdown.store(true) # signal shutdown
 
-  try: gls.file.chan.send(FileMessage(message: "", absPath: Path("/")))
-  except Exception: discard
+  withLock loggingThreadInitLock:
+    try: fileLogging.chan.send(FileMessage(message: "", absPath: Path("/")))
+    except Exception: discard
 
-  joinThread(gls.file.writerThread)
-  gls.file.chan.close()
-  gls.file.initialized.store(false)
+    joinThread(fileLogging.writerThread)
+    fileLogging.chan.close()
+    fileLogging.initialized.store(false)
 
 
 proc `=destroy`*(gls: var GlobalLogServiceObj) =
   # only one thread should cleanup
   if not gls.initialized.exchange(false): return
-
-  gls.shutdownThreadedConsoleLogging()
-  gls.shutdownThreadedFileLogging()
 
   try: deinitLock(gls.lock)
   except Exception: discard
@@ -252,12 +240,6 @@ proc ensureFreshness*(ls: var LogService) =
       "properly initialized LogService object")
 
   if ls.configVersion == ls.global.configVersion.load(): return
-
-  if ls.global.takeOverGls.isSome:
-    let newGls = ls.global.takeOverGls.get
-    assert not newGls.isNil
-    assert newGls.initialized.load
-    ls.global = newGls
 
   withLock ls.global.lock:
     ls.configVersion = ls.global.configVersion.load
@@ -434,6 +416,15 @@ proc getLogger*(
   result = Logger(scope: scope, threadSvc: ls)
 
 
+proc getLogger*(
+    ls: Option[ThreadLocalLogService],
+    scope: string,
+    lvl: Option[Level] = none[Level]()): Option[Logger] {.gcsafe.} =
+  return
+    if ls.isSome: some(getLogger(ls.get, scope, lvl))
+    else: none[Logger]()
+
+
 proc addAppender*(ls: var LogService, appender: LogAppender) {.gcsafe.} =
   ## Add a log appender to the global log service and refresh the local thread
   ## state. The updated global state will trigger other threads to refresh
@@ -554,6 +545,102 @@ template fatal*[L: Logger or Option[Logger], M](l: L, error: ref Exception, msg:
 
 
 # -----------------------------------------------------------------------------
+# Writer Thread Implementations
+# -----------------------------------------------------------------------------
+
+proc consoleWriterLoop() {.thread.} =
+  while not consoleLogging.shutdown.load():
+    var didSomething = false
+
+    let (hasData, msg) = consoleLogging.chan.tryRecv()
+    if hasData and msg.message.len > 0:  # Skip empty sentinel messages
+      try:
+        let output =
+          if msg.useStderr: stderr
+          else: stdout
+        output.write(msg.message)
+        output.flushFile()
+        didSomething = true
+      except IOError:
+        discard
+
+    # Small delay if no work to prevent busy waiting
+    if not didSomething: sleep(100)
+
+
+proc fileWriterLoop() {.thread.} =
+  const bufLen = 128
+  var msgsByPath = newTable[Path, seq[FileMessage]]()
+
+  while not fileLogging.shutdown.load():
+    var didSomething = false
+
+    var msgBuf: array[bufLen, FileMessage]
+    var recvIdx = 0
+    var writeIdx = 0
+    var dataAvailable = true
+
+    while dataAvailable and recvIdx < bufLen:
+      # Fill our message buffer if we can
+      (dataAvailable, msgBuf[recvIdx]) = fileLogging.chan.tryRecv()
+      if dataAvailable: inc recvIdx
+
+    # Organize messages by destination file
+    msgsByPath.clear()
+    while writeIdx < recvIdx:
+      let msg = msgBuf[writeIdx]
+      inc writeIdx
+
+      if msg.message.len > 0:  # skip empty sentinel messages
+        if not msgsByPath.contains(msg.absPath): msgsByPath[msg.absPath] = @[]
+        msgsByPath[msg.absPath].add(msg)
+        didSomething = true
+
+    # Write all messages in file order to optimize file open/flush/close
+    for path, msgs in pairs(msgsByPath):
+      var f: File
+
+      if not open(f, $path, fmAppend):
+        # TODO: can we do better than silently failing here?
+        continue
+
+      for m in msgs:
+        try: writeLine(f, m.message)
+        except Exception: discard
+      flushFile(f)
+      close(f)
+
+    # Wait a bit if we had no work to prevent busy waiting
+    if not didSomething: sleep(100)
+
+
+proc initThreadedConsoleLogging() =
+  if consoleLogging.initialized.load: return
+
+  withLock loggingThreadInitLock:
+    if consoleLogging.initialized.load: return
+    consoleLogging.chan.open()
+    consoleLogging.shutdown.store(false)
+
+    # Create writer thread with reference to the service
+    createThread(consoleLogging.writerThread, consoleWriterLoop)
+    consoleLogging.initialized.store(true)
+
+
+proc initThreadedFileLogging() =
+  if fileLogging.initialized.load: return
+
+  withLock loggingThreadInitLock:
+    if fileLogging.initialized.load: return
+    fileLogging.chan.open()
+    fileLogging.shutdown.store(false)
+
+    # Create writer thread with reference to the service
+    createThread(fileLogging.writerThread, fileWriterLoop)
+    fileLogging.initialized.store(true)
+
+
+# -----------------------------------------------------------------------------
 # CustomLogAppender Implementation
 # -----------------------------------------------------------------------------
 
@@ -613,41 +700,6 @@ proc initConsoleLogAppender*(
     useStderr: useStderr)
 
 
-proc consoleWriterLoop(gls: GlobalLogService) {.thread.} =
-  while not gls.console.shutdown.load():
-    var didSomething = false
-
-    let (hasData, msg) = gls.console.chan.tryRecv()
-    if hasData and msg.message.len > 0:  # Skip empty sentinel messages
-      try:
-        let output =
-          if msg.useStderr: stderr
-          else: stdout
-        output.write(msg.message)
-        output.flushFile()
-        didSomething = true
-      except IOError:
-        discard
-
-    # Small delay if no work to prevent busy waiting
-    if not didSomething: sleep(100)
-
-
-proc initThreadedConsoleLogging(gls: GlobalLogService) =
-  if gls.console.initialized.load() or  # don't double-init
-     not gls.initialized.load():        # don't init if the gls is shutting down
-    return
-
-  withLock gls.lock:
-    if gls.console.initialized.load(): return
-    gls.console.chan.open()
-    gls.console.shutdown.store(false)
-
-    # Create writer thread with reference to the service
-    createThread(gls.console.writerThread, consoleWriterLoop, gls)
-    gls.console.initialized.store(true)
-
-
 method clone*(cla: ConsoleLogAppender): LogAppender {.gcsafe.} =
   result = ConsoleLogAppender(
     namespace: cla.namespace,
@@ -661,11 +713,11 @@ proc appendLogMessageMultiThreaded(
     ls: ref LogService,
     msg: LogMessage) {.gcsafe.} =
 
-  if not ls.global.console.initialized.load():
-    ls.global.initThreadedConsoleLogging()
+  if not consoleLogging.initialized.load():
+    initThreadedConsoleLogging()
 
   try:
-    ls.global.console.chan.send(ConsoleMessage(
+    consoleLogging.chan.send(ConsoleMessage(
       message: cla.formatter(msg),
       useStderr: cla.useStderr))
   except Exception:
@@ -732,67 +784,6 @@ proc initFileLogAppender*(
     formatter: formatter,
     absPath: absolutePath(Path(filePath)))
 
-  # TODO: initialize global state for the file log writer
-
-
-proc fileWriterLoop(gls: GlobalLogService) {.thread.} =
-  const bufLen = 128
-  var msgsByPath = newTable[Path, seq[FileMessage]]()
-
-  while not gls.file.shutdown.load():
-    var didSomething = false
-
-    var msgBuf: array[bufLen, FileMessage]
-    var recvIdx = 0
-    var writeIdx = 0
-    var dataAvailable = true
-
-    while dataAvailable and recvIdx < bufLen:
-      # Fill our message buffer if we can
-      (dataAvailable, msgBuf[recvIdx]) = gls.file.chan.tryRecv()
-      if dataAvailable: inc recvIdx
-
-    # Organize messages by destination file
-    msgsByPath.clear()
-    while writeIdx < recvIdx:
-      let msg = msgBuf[writeIdx]
-      inc writeIdx
-
-      if msg.message.len > 0:  # skip empty sentinel messages
-        if not msgsByPath.contains(msg.absPath): msgsByPath[msg.absPath] = @[]
-        msgsByPath[msg.absPath].add(msg)
-        didSomething = true
-
-    # Write all messages in file order to optimize file open/flush/close
-    for path, msgs in pairs(msgsByPath):
-      var f: File
-
-      if not open(f, $path, fmAppend):
-        # TODO: can we do better than silently failing here?
-        continue
-
-      for m in msgs:
-        try: writeLine(f, m.message)
-        except Exception: discard
-      flushFile(f)
-      close(f)
-
-    # Wait a bit if we had no work to prevent busy waiting
-    if not didSomething: sleep(100)
-
-
-proc initThreadedFileLogging(gls: GlobalLogService) =
-  if gls.file.initialized.load(): return
-
-  withLock gls.lock:
-    if gls.file.initialized.load(): return
-    gls.file.chan.open()
-    gls.file.shutdown.store(false)
-
-    # Create writer thread with reference to the service
-    createThread(gls.file.writerThread, fileWriterLoop, gls)
-    gls.file.initialized.store(true)
-
 
 method clone*(fla: FileLogAppender): LogAppender {.gcsafe.} =
   result = FileLogAppender(
@@ -807,11 +798,11 @@ proc appendLogMessageMultiThreaded(
     ls: ref LogService,
     msg: LogMessage) {.gcsafe.} =
 
-  if not ls.global.file.initialized.load():
-    ls.global.initThreadedFileLogging()
+  if not fileLogging.initialized.load():
+    initThreadedFileLogging()
 
   try:
-    ls.global.file.chan.send(FileMessage(
+    fileLogging.chan.send(FileMessage(
       message: fla.formatter(msg),
       absPath: fla.absPath))
   except Exception: discard
@@ -890,113 +881,14 @@ method appendLogMessage*(
 
 
 # -----------------------------------------------------------------------------
-# Autoconfiguration Implementation
+# Cleanup
 # -----------------------------------------------------------------------------
 
-var autoGls = GlobalLogService()
-  # we create the global reference so that it is maintained by the thread that
-  # first imported this module, but leave it uninitialized until
-  # initAutoconfiguredLogService is actually called (when
-  # namespaced_logging/autoconfigured is imported)
+addExitProc(proc() =
+  shutdownThreadedConsoleLogging()
+  shutdownThreadedFileLogging()
+)
 
-var autoTlls {.threadvar.}: ThreadLocalLogService
-var autoLogger {.threadvar.}: Logger
-
-
-proc initAutoconfiguredLogService*() =
-  ## This exists primarily for namespaced_logging/autoconfigured to call as
-  ## part of its setup process. This function needs to live here and be
-  ## exported for the autoconfigured module's visibility as many of the internal
-  ## fields required to properly manage the autoconfigured LogService are not
-  ## exported, to avoid confusion and prevent misuse of the library (from a
-  ## thread-safety POV).
-
-  assert not autoGls.isNil
-
-  let oldGls = autoGls
-  autoGls = initGlobalLogService()
-
-  if oldGls.initialized.load:
-    # If we already have an auto-configured GLS, let's log to the existing GLS
-    # that we're replacing it.
-
-    withLock oldGls.lock:
-      if autoTlls.isNil:
-        # If we somehow have an auto-configured GLS but never instantiated a
-        # thread-local LogService, let's do so temporarily.
-        autoTlls = new(LogService)
-        autoTlls.global = oldGls
-        ensureFreshness(autoTlls)
-
-      warn(
-        getLogger(autoTlls, "namespaced_logging/autoconfigured"),
-        "initializing a new auto-configured logging service, replacing this one")
-
-      oldGls.takeOverGls = some(autoGls)
-      oldGls.configVersion.atomicInc
-
-  autoTlls = threadLocalRef(initLogService(autoGls))
-  autoLogger = autoTlls.getLogger("")
-
-
-proc getAutoconfiguredLogService*(): ThreadLocalLogService =
-  if autoTlls.isNil:
-    if not autoGls.initialized.load():
-      initAutoconfiguredLogService()
-      assert autoGls.initialized.load()
-
-    autoTlls = threadLocalRef(initLogService(autoGls))
-
-  return autoTlls
-
-
-proc getAutoconfiguredLogger*(): Logger =
-  if autoLogger.isNil:
-    autoLogger = getLogger(getAutoconfiguredLogService(), "")
-
-  return autoLogger
-
-
-proc useForAutoconfiguredLogging*(ls: LogService) =
-  # Reconfigure the autoconfigured logging behavior to use the given LogService
-  # configuration instead of the existing autoconfigured configuration. This is
-  # useful in applications that want to control the behavior of third-party
-  # libraries or code that use namespaced_logging/autoconfigured.
-  #
-  # Libraries and other non-application code are suggested to use
-  # namespaced_logging/autoconfigured. The autoconfigured log service has no
-  # appenders when it is initialized which means that applications which are
-  # unaware of namespaced_logging are unaffected and no logs are generated.
-
-  if ls.global == autoGls:
-    # As of Nim 2 `==` on `ref`s performs a referential equality check by
-    # default, and we don't overload `==`. Referential equality is what we're
-    # after here. If the reference in ls already points to the same place as
-    # autoGls, we have nothing to do
-    return
-
-  if autoGls.initialized.load:
-    # if there is an existing autoGls, let's leave instructions for loggers and
-    # LogService instances to move to the newly provided GLS before we change
-    # our autoGls reference.
-    withLock autoGls.lock:
-      autoGls.takeOverGls = some(ls.global)
-      autoGls.configVersion.atomicInc
-
-  autoGls = ls.global
-
-
-proc useForAutoconfiguredLogging*(tlls: ThreadLocalLogService) =
-  useForAutoconfiguredLogging(tlls[])
-
-
-proc resetAutoconfiguredLogging*() =
-  ## Reset the auto-configured logging service. In general it is suggested to
-  # define a new LogService, configure it, and pass it to
-  # *useForAutoconfiguredLogging* instead.  in a way that disconnects it
-  #from
-  autoGls = GlobalLogService()
-  initAutoconfiguredLogService()
 
 # -----------------------------------------------------------------------------
 # Tests
