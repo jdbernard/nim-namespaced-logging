@@ -301,7 +301,7 @@ for the custom functionality.
 *TODO: rethink this. I chose this to avoid GC-safety issues copying closures
 across threads, but maybe I don't need this separate, explicit state field.*
 
-> [!WARNING] The `state` data type must support copy semantics on assignment.
+> [!CAUTION] The `state` data type must support copy semantics on assignment.
 > It is possible to pass a `ref` to `state` and/or data structures that include
 > `ref`s, but **you must guarantee they remain valid**, either by allocating
 > shared memeory, or (preferably) keeping alive a reference to them that the GC
