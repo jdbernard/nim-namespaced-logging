@@ -391,6 +391,17 @@ proc setThreshold*(ls: ThreadLocalLogService, scope: string, lvl: Level) {.gcsaf
   setThreshold(ls[], scope, lvl)
 
 
+proc setThresholds*(ls: var LogService, thresholds: TableRef[string, Level]) {.gcsafe.} =
+  withLock ls.global.lock:
+    for k,v in thresholds: ls.global.thresholds[k] = v
+    ls.global.configVersion.atomicInc
+
+  ensureFreshness(ls)
+
+
+proc setThresholds*(ls: ThreadLocalLogService, thresholds: TableRef[string, Level]) {.gcsafe.} =
+  setThresholds(ls[], thresholds)
+
 proc getLogger*(
     ls: ThreadLocalLogService,
     scope: string,
@@ -424,6 +435,12 @@ proc getLogger*(
     if ls.isSome: some(getLogger(ls.get, scope, lvl))
     else: none[Logger]()
 
+
+proc appenders*(ls: var LogService): seq[LogAppender] {.gcsafe.} =
+  for a in ls.appenders: result.add(clone(a))
+
+proc appenders*(ls: ThreadLocalLogService): seq[LogAppender] {.gcsafe.} =
+  ls[].appenders()
 
 proc addAppender*(ls: var LogService, appender: LogAppender) {.gcsafe.} =
   ## Add a log appender to the global log service and refresh the local thread
