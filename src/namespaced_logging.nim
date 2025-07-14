@@ -23,7 +23,7 @@ type
 
 
   ErrorHandlerFunc* =
-    proc (error: ref Exception, msg: string) {.gcsafe,nimcall.}
+    proc (err: ref Exception, msg: string) {.gcsafe,nimcall.}
 
 
   LogService* = object
@@ -66,21 +66,21 @@ type
   LogMessage* = object
     scope*: string
     level*: Level
-    error*: Option[ref Exception]
-    timestamp*: DateTime
-    message*: string
+    err*: Option[ref Exception]
+    ts*: DateTime
+    msg*: string
     additionalData*: JsonNode
 
 
   LogMessageFormatter* = proc (msg: LogMessage): string {.gcsafe.}
 
   ConsoleMessage = object
-    message: string
+    msg: string
     useStderr: bool
 
 
   FileMessage = object
-    message: string
+    msg: string
     absPath: Path
 
 
@@ -139,16 +139,16 @@ initLock(loggingThreadInitLock)
 proc initLogMessage*(
     scope: string,
     lvl: Level,
-    message: string,
-    error: Option[ref Exception] = none[ref Exception](),
+    msg: string,
+    err: Option[ref Exception] = none[ref Exception](),
     additionalData: JsonNode = JNULL): LogMessage =
 
   LogMessage(
     scope: scope,
     level: lvl,
-    error: error,
-    timestamp: now(),
-    message: message,
+    err: err,
+    ts: now(),
+    msg: msg,
     additionalData: additionalData)
 
 
@@ -156,15 +156,16 @@ proc initLogMessage*(
     scope: string,
     lvl: Level,
     msg: JsonNode,
-    error: Option[ref Exception] = none[ref Exception]()): LogMessage =
+    err: Option[ref Exception] = none[ref Exception]()): LogMessage =
 
   LogMessage(
     scope: scope,
     level: lvl,
-    error: error,
-    timestamp: now(),
-    message:
-      if msg.hasKey("message"): msg["message"].getStr
+    err: err,
+    ts: now(),
+    msg:
+      if msg.hasKey("msg"): msg["msg"].getStr
+      elif msg.hasKey("message"): msg["message"].getStr
       else: "",
     additionalData: msg)
 
@@ -196,7 +197,7 @@ proc shutdownThreadedConsoleLogging() =
     consoleLogging.shutdown.store(true) # signal shutdown
 
     # Send sentinel values to wake up the writer thread
-    try: consoleLogging.chan.send(ConsoleMessage(message: "", useStderr: false))
+    try: consoleLogging.chan.send(ConsoleMessage(msg: "", useStderr: false))
     except Exception: discard
 
     joinThread(consoleLogging.writerThread)
@@ -210,7 +211,7 @@ proc shutdownThreadedFileLogging() =
   fileLogging.shutdown.store(true) # signal shutdown
 
   withLock loggingThreadInitLock:
-    try: fileLogging.chan.send(FileMessage(message: "", absPath: Path("/")))
+    try: fileLogging.chan.send(FileMessage(msg: "", absPath: Path("/")))
     except Exception: discard
 
     joinThread(fileLogging.writerThread)
@@ -334,13 +335,13 @@ func `%`*(msg: LogMessage): JsonNode =
   result = %*{
     "scope": msg.scope,
     "level": fmtLevel(msg.level),
-    "message": msg.message,
-    "timestamp": msg.timestamp.formatIso8601
+    "msg": msg.msg,
+    "ts": msg.ts.formatIso8601
   }
 
-  if msg.error.isSome:
-    result["error"] = %($msg.error.get.name & ": " & msg.error.get.msg)
-    result["stacktrace"] = %($msg.error.get.trace)
+  if msg.err.isSome:
+    result["err"] = %($msg.err.get.name & ": " & msg.err.get.msg)
+    result["stacktrace"] = %($msg.err.get.trace)
 
   if msg.additionalData.kind == JObject:
     for (k, v) in pairs(msg.additionalData):
@@ -373,7 +374,7 @@ proc setRootThreshold*(ls: ThreadLocalLogService, lvl: Level) {.gcsafe.} =
   setRootThreshold(ls[], lvl)
 
 
-func formatSimpleTextLog*(msg: LogMessage): string {.gcsafe.} = msg.message
+func formatSimpleTextLog*(msg: LogMessage): string {.gcsafe.} = msg.msg
 
 
 func formatJsonStructuredLog*(msg: LogMessage): string {.gcsafe.} = $(%msg)
@@ -515,13 +516,12 @@ template log*(l: Logger, lvl: Level, msg: untyped) =
     sendToAppenders(l, initLogMessage(l.scope, lvl, msg))
 
 
-template log*[T: ref Exception](l: Logger, lvl: Level, err: T, msg: untyped) =
+template log*(l: Logger, lvl: Level, err: ref Exception, msg: untyped) =
   ensureFreshness(l.threadSvc)
 
   if lvl >= l.getEffectiveThreshold:
-    sendToAppenders(
-      l,
-      initLogMessage(l.scope, lvl, msg, some(cast[ref Exception](err))))
+    sendToAppenders(l, initLogMessage(
+      l.scope, lvl, msg, some(cast[ref Exception](err))))
 
 template log*(l: Option[Logger], lm: LogMessage) =
   if l.isSome: log(l.get, lm)
@@ -532,9 +532,9 @@ template log*(l: Option[Logger], lvl: Level, msg: untyped) =
 template log*(
     l: Option[Logger],
     lvl: Level,
-    error: ref Exception,
+    err: ref Exception,
     msg: untyped) =
-  if l.isSome: log(l.get, lvl, error, msg)
+  if l.isSome: log(l.get, lvl, err, msg)
 
 template debug*[L: Logger or Option[Logger], M](l: L, msg: M) =
   log(l, lvlDebug, msg)
@@ -551,14 +551,14 @@ template warn*[L: Logger or Option[Logger], M](l: L, msg: M) =
 template error*[L: Logger or Option[Logger], M](l: L, msg: M) =
   log(l, lvlError, msg)
 
-template error*[L: Logger or Option[Logger], M](l: L, error: ref Exception, msg: M) =
-  log(l, lvlError, error, msg)
+template error*[L: Logger or Option[Logger], M](l: L, err: ref Exception, msg: M) =
+  log(l, lvlError, err, msg)
 
 template fatal*[L: Logger or Option[Logger], M](l: L, msg: M) =
   log(l, lvlFatal, msg)
 
-template fatal*[L: Logger or Option[Logger], M](l: L, error: ref Exception, msg: M) =
-  log(l, lvlFatal, error, msg)
+template fatal*[L: Logger or Option[Logger], M](l: L, err: ref Exception, msg: M) =
+  log(l, lvlFatal, err, msg)
 
 
 # -----------------------------------------------------------------------------
@@ -569,13 +569,13 @@ proc consoleWriterLoop() {.thread.} =
   while not consoleLogging.shutdown.load():
     var didSomething = false
 
-    let (hasData, msg) = consoleLogging.chan.tryRecv()
-    if hasData and msg.message.len > 0:  # Skip empty sentinel messages
+    let (hasData, cMsgObj) = consoleLogging.chan.tryRecv()
+    if hasData and cMsgObj.msg.len > 0:  # Skip empty sentinel messages
       try:
         let output =
-          if msg.useStderr: stderr
+          if cMsgObj.useStderr: stderr
           else: stdout
-        output.write(msg.message)
+        output.write(cMsgObj.msg)
         output.flushFile()
         didSomething = true
       except IOError:
@@ -605,12 +605,12 @@ proc fileWriterLoop() {.thread.} =
     # Organize messages by destination file
     msgsByPath.clear()
     while writeIdx < recvIdx:
-      let msg = msgBuf[writeIdx]
+      let fMsgObj = msgBuf[writeIdx]
       inc writeIdx
 
-      if msg.message.len > 0:  # skip empty sentinel messages
-        if not msgsByPath.contains(msg.absPath): msgsByPath[msg.absPath] = @[]
-        msgsByPath[msg.absPath].add(msg)
+      if fMsgObj.msg.len > 0:  # skip empty sentinel messages
+        if not msgsByPath.contains(fMsgObj.absPath): msgsByPath[fMsgObj.absPath] = @[]
+        msgsByPath[fMsgObj.absPath].add(fMsgObj)
         didSomething = true
 
     # Write all messages in file order to optimize file open/flush/close
@@ -622,7 +622,7 @@ proc fileWriterLoop() {.thread.} =
         continue
 
       for m in msgs:
-        try: writeLine(f, m.message)
+        try: writeLine(f, m.msg)
         except Exception: discard
       flushFile(f)
       close(f)
@@ -735,7 +735,7 @@ proc appendLogMessageMultiThreaded(
 
   try:
     consoleLogging.chan.send(ConsoleMessage(
-      message: cla.formatter(msg),
+      msg: cla.formatter(msg),
       useStderr: cla.useStderr))
   except Exception:
     try:
@@ -746,9 +746,9 @@ proc appendLogMessageMultiThreaded(
       output.writeLine(cla.formatter(LogMessage(
         scope: "namespaced_logging",
         level: lvlError,
-        error: some(getCurrentException()),
-        timestamp: now(),
-        message: "Unable to write log to channel in multi-threaded context."
+        err: some(getCurrentException()),
+        ts: now(),
+        msg: "Unable to write log to channel in multi-threaded context."
       )))
       output.flushFile()
     except Exception: discard
@@ -820,7 +820,7 @@ proc appendLogMessageMultiThreaded(
 
   try:
     fileLogging.chan.send(FileMessage(
-      message: fla.formatter(msg),
+      msg: fla.formatter(msg),
       absPath: fla.absPath))
   except Exception: discard
 
@@ -1052,7 +1052,7 @@ when isMainModule:
       let logger = ls.getLogger("test")
 
       logger.log(lvlDebug, "debug string msg")
-      logger.log(lvlInfo, %*{"message": "info json msg"})
+      logger.log(lvlInfo, %*{"msg": "info json msg"})
       logger.log(lvlNotice, "notice string msg")
       logger.log(lvlError, newException(ValueError, "exception msg"), "error ex. msg")
 
@@ -1060,13 +1060,13 @@ when isMainModule:
       check:
         lm.len == 4
         lm[0].level == lvlDebug
-        lm[0].message.contains("debug string msg")
+        lm[0].msg.contains("debug string msg")
         lm[1].level == lvlInfo
-        lm[1].message.contains("info json msg")
+        lm[1].msg.contains("info json msg")
         lm[2].level == lvlNotice
-        lm[2].message.contains("notice string msg")
+        lm[2].msg.contains("notice string msg")
         lm[3].level == lvlError
-        lm[3].message.contains("error ex. msg")
+        lm[3].msg.contains("error ex. msg")
 
     test "logger convenience methods work":
       let logger = ls.getLogger("test")
@@ -1097,8 +1097,8 @@ when isMainModule:
       let lm = loggedMsgs.get()
       check:
         lm.len == 1
-        lm[0].error.isSome
-        lm[0].error.get.msg == "test error"
+        lm[0].err.isSome
+        lm[0].err.get.msg == "test error"
 
     test "optional logger methods":
 
@@ -1110,7 +1110,7 @@ when isMainModule:
 
       let lm = loggedMsgs.get()
       check lm.len == 1
-      check lm[0].message == "test message"
+      check lm[0].msg == "test message"
 
   suite "Threshold and Filtering":
     setup:
@@ -1182,7 +1182,7 @@ when isMainModule:
       let lm = loggedMsgs.get()
       check:
         lm.len == 1
-        lm[0].message.contains("Expensive call (1)")
+        lm[0].msg.contains("Expensive call (1)")
         expensiveCallCount == 1
 
   suite "Appender Functionality":
@@ -1359,9 +1359,9 @@ when isMainModule:
         lines[2] == "ERROR [test] message at error"
 
         lm.len == 3
-        lm[0].message.contains("message at notice")
-        lm[1].message.contains("message at warn")
-        lm[2].message.contains("message at fatal")
+        lm[0].msg.contains("message at notice")
+        lm[1].msg.contains("message at warn")
+        lm[2].msg.contains("message at fatal")
 
     test "fallbackOnly works when off":
       ls.addAppender(initStdLoggingAppender(fallbackOnly = false))
@@ -1394,6 +1394,6 @@ when isMainModule:
         lines[5] == "FATAL [test] message at fatal"
 
         lm.len == 3
-        lm[0].message.contains("message at notice")
-        lm[1].message.contains("message at warn")
-        lm[2].message.contains("message at fatal")
+        lm[0].msg.contains("message at notice")
+        lm[1].msg.contains("message at warn")
+        lm[2].msg.contains("message at fatal")
