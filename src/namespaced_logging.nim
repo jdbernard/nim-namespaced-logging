@@ -548,6 +548,9 @@ template notice*[L: Logger or Option[Logger], M](l: L, msg: M) =
 template warn*[L: Logger or Option[Logger], M](l: L, msg: M) =
   log(l, lvlWarn, msg)
 
+template warn*[L: Logger or Option[Logger], M](l: L, err: ref Exception, msg: M) =
+  log(l, lvlWarn, err, msg)
+
 template error*[L: Logger or Option[Logger], M](l: L, msg: M) =
   log(l, lvlError, msg)
 
