@@ -127,7 +127,6 @@ type
     formatter*: LogMessageFormatter
 
 const UninitializedConfigVersion = low(int)
-let JNULL = newJNull()
 
 var consoleLogging {.global.}: LogWriterThreadState[ConsoleMessage]
 var fileLogging {.global.}: LogWriterThreadState[FileMessage]
@@ -141,7 +140,7 @@ proc initLogMessage*(
     lvl: Level,
     msg: string,
     err: Option[ref Exception] = none[ref Exception](),
-    additionalData: JsonNode = JNULL): LogMessage =
+    additionalData: JsonNode = newJNull()): LogMessage =
 
   LogMessage(
     scope: scope,
